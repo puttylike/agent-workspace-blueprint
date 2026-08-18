@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+  <nav class="breadcrumb" aria-label="Breadcrumb"><a href="{{ url_for('wiki') }}">Wiki</a><span aria-hidden="true">/</span><span>{{ document.path }}</span></nav>
+  <article class="wiki-document">
+    <header><p class="eyebrow">Knowledge document</p><h1>{{ document.title }}</h1>{% if document.updated_at %}<p>Updated <time datetime="{{ document.updated_at }}">{{ document.updated_at }}</time></p>{% endif %}</header>
+    <div class="markdown-body">{{ document.html|safe }}</div>
+  </article>
+{% endblock %}

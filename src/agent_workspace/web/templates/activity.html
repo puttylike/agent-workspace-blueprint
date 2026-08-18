@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_macros.html" import source_notice with context %}
+{% block content %}
+  <section class="page-heading"><div><p class="eyebrow">Observed events</p><h1>Recent activity</h1><p>Git commits, pull requests, and agent activity without runtime session identifiers.</p></div></section>
+  {{ source_notice(source) }}
+  <ol class="timeline">
+    {% for item in activity %}
+      <li>
+        <span class="timeline-marker" aria-hidden="true"></span>
+        <div><p class="eyebrow">{{ item.type }}{% if item.project_id %} · {{ item.project_id }}{% endif %}</p><h2>{{ item.title }}</h2>{% if item.timestamp %}<time datetime="{{ item.timestamp }}" data-relative-time>{{ item.timestamp }}</time>{% else %}<span class="unknown">Time unavailable</span>{% endif %}{% if item.url %}<p><a href="{{ item.url }}" rel="noreferrer">Open source record</a></p>{% endif %}</div>
+      </li>
+    {% else %}<li class="empty-state"><h2>No activity available</h2><p>No recent event could be displayed.</p></li>{% endfor %}
+  </ol>
+{% endblock %}

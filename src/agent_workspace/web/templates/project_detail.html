@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% from "_macros.html" import source_notice, value_or_unknown with context %}
+{% block content %}
+  {% if project %}
+    <section class="page-heading">
+      <div><p class="eyebrow">{{ project.type }} · {{ project.lifecycle }}</p><h1>{{ project.name }}</h1><p class="mono">{{ project.id }}</p></div>
+      <span class="phase phase-{{ project.phase|lower }}">{{ project.phase }}</span>
+    </section>
+    {{ source_notice(source) }}
+    {% if project.source_alerts %}<div class="source-notice source-unavailable" role="status"><strong>Partial data</strong>{% for item in project.source_alerts %}<span>{{ item.source }}: {{ item.availability }}</span>{% endfor %}</div>{% endif %}
+    <section class="detail-grid">
+      <article class="panel">
+        <h2>Git</h2>
+        <dl class="detail-list">
+          <div><dt>Branch</dt><dd class="mono wrap">{{ value_or_unknown(project.branch) }}</dd></div>
+          <div><dt>HEAD</dt><dd class="mono wrap">{{ value_or_unknown(project.head) }}</dd></div>
+          <div><dt>Working tree</dt><dd>{% if project.git_clean is sameas true %}<span class="state-good">CLEAN</span>{% elif project.git_clean is sameas false %}<span class="state-warn">DIRTY</span>{% else %}<span class="unknown">UNKNOWN</span>{% endif %}</dd></div>
+          <div><dt>Upstream</dt><dd>{{ project.ahead if project.ahead is not none else '—' }} ahead · {{ project.behind if project.behind is not none else '—' }} behind</dd></div>
+        </dl>
+      </article>
+      <article class="panel">
+        <h2>Tasks</h2>
+        <dl class="metric-grid">
+          <div><dt>Open</dt><dd>{{ project.tasks.open if project.tasks.open is not none else '—' }}</dd></div>
+          <div><dt>Ready</dt><dd>{{ project.tasks.ready if project.tasks.ready is not none else '—' }}</dd></div>
+          <div><dt>Blocked</dt><dd>{{ project.tasks.blocked if project.tasks.blocked is not none else '—' }}</dd></div>
+          <div><dt>Completed</dt><dd>{{ project.tasks.completed if project.tasks.completed is not none else '—' }}</dd></div>
+        </dl>
+        <p class="muted">Beads: {{ project.beads_version or 'UNKNOWN' }}</p>
+        {% if project.progress_percent is not none %}<p><strong>{{ project.progress_percent }}%</strong> calculated from completed / total tasks.</p>{% else %}<p>No numeric progress is shown because no calculable task total is available. Phase: <strong>{{ project.phase }}</strong>.</p>{% endif %}
+      </article>
+      <article class="panel">
+        <h2>Ownership</h2>
+        <dl class="detail-list">
+          <div><dt>Agent</dt><dd>{{ value_or_unknown(project.agent_id) }}</dd></div>
+          <div><dt>Lifecycle</dt><dd>{{ value_or_unknown(project.lifecycle) }}</dd></div>
+          <div><dt>Phase</dt><dd>{{ value_or_unknown(project.phase) }}</dd></div>
+        </dl>
+      </article>
+      <article class="panel">
+        <h2>Pull request</h2>
+        {% if project.pull_request %}
+          <p class="large-value">#{{ project.pull_request.number or '—' }}</p>
+          <p>{{ project.pull_request.state or 'UNKNOWN' }}{% if project.pull_request.is_draft or project.pull_request.draft %} · DRAFT{% endif %}</p>
+          {% if project.pull_request.url %}<p><a href="{{ project.pull_request.url }}" rel="noreferrer">View pull request</a></p>{% endif %}
+        {% else %}<p>No pull request reported.</p>{% endif %}
+      </article>
+      <article class="panel wide-panel">
+        <h2>User confirmation</h2>
+        {% if project.needs_user %}<ul>{% for item in project.needs_user %}<li>{{ item }}</li>{% endfor %}</ul>{% else %}<p>No user confirmation item is currently reported.</p>{% endif %}
+      </article>
+    </section>
+  {% else %}
+    <section class="page-heading"><div><p class="eyebrow">Unavailable</p><h1>Project data unavailable</h1></div></section>
+    {{ source_notice(source) }}
+  {% endif %}
+{% endblock %}

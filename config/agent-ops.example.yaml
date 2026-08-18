@@ -1,0 +1,21 @@
+version: 1
+listen_host: 127.0.0.1
+listen_port: 3001
+project_registry: /srv/agent-ops/config/projects.yaml
+knowledge_root: /srv/agent-knowledge
+blueprint_root: /opt/agent-workspace-blueprint
+runtime:
+  sqlite_cache: /var/lib/agent-ops/runtime/agent-ops.db
+commands:
+  git: /usr/bin/git
+  gh: /usr/bin/gh
+  openclaw: /opt/openclaw/bin/openclaw
+  timeout_seconds: 10
+  stdout_limit_bytes: 1048576
+  stderr_limit_bytes: 65536
+cache_ttl_seconds: 30
+openclaw:
+  access_method: local_gateway_rpc
+  manager_agent_id: workspace-manager
+  legacy_agents:
+    - legacy-default

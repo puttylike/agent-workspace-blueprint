@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import project_card, source_notice with context %}
+{% block content %}
+  <section class="page-heading">
+    <div><p class="eyebrow">Registry</p><h1>Projects</h1><p>Each card is assembled from authoritative, independently queried sources.</p></div>
+  </section>
+  {{ source_notice(source) }}
+  <section class="card-grid" aria-label="Project list">
+    {% for project in projects %}{{ project_card(project) }}{% else %}
+      <div class="empty-state"><h2>No project data available</h2><p>No registered project could be displayed.</p></div>
+    {% endfor %}
+  </section>
+{% endblock %}

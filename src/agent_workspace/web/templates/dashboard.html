@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import project_card, source_notice with context %}
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Workspace control plane</p>
+      <h1>Project overview</h1>
+      <p>Live read-only observations from the registry, Git, tasks, pull requests, and agent runtime.</p>
+    </div>
+    <div class="summary-stat"><strong>{{ projects|length }}</strong><span>registered projects</span></div>
+  </section>
+  {{ source_notice(source) }}
+  <section class="card-grid" aria-label="Registered projects">
+    {% for project in projects %}
+      {{ project_card(project) }}
+    {% else %}
+      <div class="empty-state"><h2>No project data available</h2><p>The registry may be empty or temporarily unavailable.</p></div>
+    {% endfor %}
+  </section>
+{% endblock %}

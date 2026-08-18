@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import source_notice with context %}
+{% block content %}
+  <section class="page-heading"><div><p class="eyebrow">Private knowledge</p><h1>Wiki</h1><p>Sanitized Markdown backed by a disposable SQLite FTS5 search cache.</p></div></section>
+  {{ source_notice(source) }}
+  <form class="search-form" action="{{ url_for('wiki') }}" method="get" role="search">
+    <label for="wiki-query">Search knowledge</label>
+    <div><input id="wiki-query" name="q" type="search" maxlength="200" value="{{ query }}" placeholder="Search titles and document text"><button type="submit">Search</button></div>
+  </form>
+  {% if search_results is not none %}
+    {% if search_source %}{{ source_notice(search_source) }}{% endif %}
+    <section aria-labelledby="search-results"><h2 id="search-results">Search results</h2><div class="document-list">
+      {% for result in search_results %}<article><h3><a href="{{ url_for('wiki_document', path=result.path) }}">{{ result.title }}</a></h3><p>{{ result.snippet }}</p><p class="mono muted">{{ result.path }}</p></article>{% else %}<p>No documents matched “{{ query }}”.</p>{% endfor %}
+    </div></section>
+  {% else %}
+    <section aria-labelledby="wiki-documents"><h2 id="wiki-documents">Documents</h2><div class="document-list">
+      {% for document in documents %}<article><h3><a href="{{ url_for('wiki_document', path=document.path) }}">{{ document.title }}</a></h3><p class="mono muted">{{ document.path }}</p>{% if document.updated_at %}<p>Updated <time datetime="{{ document.updated_at }}">{{ document.updated_at }}</time></p>{% endif %}</article>{% else %}<p>No knowledge documents are available.</p>{% endfor %}
+    </div></section>
+  {% endif %}
+{% endblock %}

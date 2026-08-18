@@ -1,0 +1,17 @@
+[Unit]
+Description=Read-only Agent Ops dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent-workspace-blueprint
+Environment=AWC_CONFIG=/etc/agent-ops/agent-ops.yaml
+ExecStart=/opt/agent-workspace-blueprint/.venv/bin/awc serve --host 127.0.0.1 --port 3001
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target
+

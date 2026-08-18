@@ -1,0 +1,77 @@
+{% macro source_notice(source) -%}
+  {% if source.availability != 'AVAILABLE' %}
+    <div class="source-notice source-unavailable" role="status">
+      <strong>{{ source.availability }}</strong>
+      <span>{{ source.message or 'This source is temporarily unavailable.' }}</span>
+      {% if source.stale and source.observed_at %}
+        <span>Last success <time datetime="{{ source.observed_at }}" data-relative-time>{{ source.observed_at }}</time>.</span>
+      {% endif %}
+      <span>Attempted <time datetime="{{ source.queried_at }}" data-relative-time>{{ source.queried_at }}</time>.</span>
+    </div>
+  {% endif %}
+{%- endmacro %}
+
+{% macro value_or_unknown(value) -%}
+  {% if value is none or value == '' %}<span class="unknown">UNKNOWN</span>{% else %}{{ value }}{% endif %}
+{%- endmacro %}
+
+{% macro project_card(project) -%}
+  <article class="card project-card">
+    <div class="card-heading">
+      <div>
+        <p class="eyebrow">{{ project.type }}</p>
+        <h2><a href="{{ url_for('project_detail', project_id=project.id) }}">{{ project.name }}</a></h2>
+      </div>
+      <span class="phase phase-{{ project.phase|lower }}">{{ project.phase }}</span>
+    </div>
+
+    <dl class="compact-grid">
+      <div><dt>Lifecycle</dt><dd>{{ value_or_unknown(project.lifecycle) }}</dd></div>
+      <div><dt>Lead</dt><dd>{{ value_or_unknown(project.agent_id) }}</dd></div>
+      <div class="wide"><dt>Branch</dt><dd class="mono wrap">{{ value_or_unknown(project.branch) }}</dd></div>
+      <div>
+        <dt>Git</dt>
+        <dd>
+          {% if project.git_clean is sameas true %}<span class="state-good">CLEAN</span>
+          {% elif project.git_clean is sameas false %}<span class="state-warn">DIRTY</span>
+          {% else %}<span class="unknown">UNKNOWN</span>{% endif %}
+        </dd>
+      </div>
+      <div><dt>Tasks</dt><dd>{{ project.tasks.open if project.tasks.open is not none else '—' }} open · {{ project.tasks.ready if project.tasks.ready is not none else '—' }} ready · {{ project.tasks.blocked if project.tasks.blocked is not none else '—' }} blocked</dd></div>
+      <div class="wide">
+        <dt>Recent commit</dt>
+        <dd>
+          {% if project.recent_commit %}
+            {{ project.recent_commit.subject or project.recent_commit.title or project.recent_commit }}
+            {% if project.recent_commit.sha %}<span class="mono muted">{{ project.recent_commit.sha[:10] }}</span>{% endif %}
+          {% else %}<span class="unknown">UNKNOWN</span>{% endif %}
+        </dd>
+      </div>
+    </dl>
+
+    {% if project.progress_percent is not none %}
+      <div class="progress-row" aria-label="Task progress {{ project.progress_percent }} percent">
+        <span>Task completion</span>
+        <progress max="100" value="{{ project.progress_percent }}">{{ project.progress_percent }}%</progress>
+        <strong>{{ project.progress_percent }}%</strong>
+      </div>
+    {% else %}
+      <p class="phase-only">No calculable task total. Current phase: <strong>{{ project.phase }}</strong>.</p>
+    {% endif %}
+
+    <div class="card-footer">
+      <span>
+        {% if project.pull_request %}
+          PR #{{ project.pull_request.number or '—' }} · {{ project.pull_request.state or 'UNKNOWN' }}{% if project.pull_request.is_draft or project.pull_request.draft %} · DRAFT{% endif %}
+        {% else %}No pull request reported{% endif %}
+      </span>
+      {% if project.needs_user %}<span class="state-warn">User confirmation needed</span>{% else %}<span>No user action reported</span>{% endif %}
+    </div>
+    {% if project.source_alerts %}
+      <p class="source-inline">
+        {% for item in project.source_alerts %}<span>{{ item.source }}: {{ item.availability }}</span>{% endfor %}
+      </p>
+    {% endif %}
+    {% if project.last_queried_at %}<p class="timestamp">Queried <time datetime="{{ project.last_queried_at }}" data-relative-time>{{ project.last_queried_at }}</time></p>{% endif %}
+  </article>
+{%- endmacro %}

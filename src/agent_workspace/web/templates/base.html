@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>{{ title }} · Agent Ops</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    <script src="{{ url_for('static', path='app.js') }}" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="{{ url_for('dashboard') }}" aria-label="Agent Ops home">
+        <span class="brand-mark" aria-hidden="true">AO</span>
+        <span>Agent Ops</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="{{ url_for('dashboard') }}" {% if active == 'dashboard' %}aria-current="page"{% endif %}>Overview</a>
+        <a href="{{ url_for('projects') }}" {% if active == 'projects' %}aria-current="page"{% endif %}>Projects</a>
+        <a href="{{ url_for('agents') }}" {% if active == 'agents' %}aria-current="page"{% endif %}>Agents</a>
+        <a href="{{ url_for('activity') }}" {% if active == 'activity' %}aria-current="page"{% endif %}>Activity</a>
+        <a href="{{ url_for('wiki') }}" {% if active == 'wiki' %}aria-current="page"{% endif %}>Wiki</a>
+      </nav>
+    </header>
+
+    <aside class="read-only-banner" role="status">
+      <strong>Read-only</strong>
+      <span>This dashboard observes authoritative sources. It cannot modify projects, tasks, agents, or pull requests.</span>
+    </aside>
+
+    <main id="content">
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer>
+      <span>Agent Ops observability layer</span>
+      <span>No write operations are exposed.</span>
+    </footer>
+  </body>
+</html>

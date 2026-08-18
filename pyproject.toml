@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-workspace-blueprint"
+version = "0.1.0"
+description = "Read-only workspace controller and Agent Ops dashboard"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "fastapi==0.141.1",
+  "Jinja2==3.1.6",
+  "markdown-it-py==4.2.0",
+  "nh3==0.3.6",
+  "PyYAML==6.0.3",
+  "uvicorn==0.52.3",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx==0.28.1",
+  "pytest==8.4.2",
+]
+
+[project.scripts]
+awc = "agent_workspace.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"agent_workspace.web" = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
