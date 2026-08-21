@@ -51,12 +51,16 @@ class OpenClawReader:
         *,
         cache_ttl_seconds: int = 30,
         working_directory: Path | None = None,
+        ui_timeout_seconds: float = 7.0,
     ) -> None:
         self.executable = Path(executable)
         self.runner = runner
         self.cache = ObservationCache(cache_ttl_seconds)
         self.failure_cache = ObservationCache(cache_ttl_seconds)
         self.working_directory = (working_directory or Path.cwd()).resolve()
+        self.ui_timeout_seconds = max(
+            0.1, min(float(getattr(runner, "timeout_seconds", 10.0)), ui_timeout_seconds)
+        )
 
     def _call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         if method not in {"agents.list", "sessions.list"}:
@@ -71,7 +75,7 @@ class OpenClawReader:
             "--params",
             encoded,
             "--timeout",
-            str(max(1, int(self.runner.timeout_seconds * 1000))),
+            str(max(1, int(self.ui_timeout_seconds * 1000))),
         ]
         result = self.runner.run(argv, cwd=self.working_directory)
         if not result.ok:
@@ -82,6 +86,15 @@ class OpenClawReader:
             return _payload(json.loads(result.stdout))
         except json.JSONDecodeError as exc:
             raise ReaderError("OpenClaw returned invalid JSON") from exc
+
+    def _cached_or_unknown(self, cache_key: str, source: str, reason: str) -> SourceObservation:
+        cached = self.cache.fresh(cache_key)
+        if cached:
+            return cached
+        last = self.cache.last(cache_key)
+        if last and last.data is not None:
+            return SourceObservation.unavailable(source, reason, last)
+        return SourceObservation.unknown(source, reason)
 
     def list_agents(self) -> SourceObservation:
         cache_key = "agents.list"
@@ -135,10 +148,34 @@ class OpenClawReader:
             self.failure_cache.remember(cache_key, failure)
             return failure
 
-    def recent_session(self, agent_id: str) -> SourceObservation:
-        if not _AGENT_ID.fullmatch(agent_id):
-            return SourceObservation.unknown("openclaw_sessions", "agent id is invalid")
-        cache_key = f"sessions:{agent_id}"
+    def cached_agents(self, reason: str = "live OpenClaw agents were not queried") -> SourceObservation:
+        return self._cached_or_unknown("agents.list", "openclaw_agents", reason)
+
+    @staticmethod
+    def _session_agent_id(item: Mapping[str, Any]) -> str | None:
+        runtime = item.get("agentRuntime")
+        if isinstance(runtime, Mapping):
+            agent_id = runtime.get("id")
+            if isinstance(agent_id, str) and _AGENT_ID.fullmatch(agent_id):
+                return agent_id
+        for key in ("agentId", "agent_id"):
+            agent_id = item.get(key)
+            if isinstance(agent_id, str) and _AGENT_ID.fullmatch(agent_id):
+                return agent_id
+        return None
+
+    @staticmethod
+    def _session_timestamp(item: Mapping[str, Any]) -> str | None:
+        for key in ("updatedAt", "lastActivityAt", "endedAt", "startedAt"):
+            stamp = _timestamp(item.get(key))
+            if stamp is not None:
+                return stamp
+        return None
+
+    def list_agent_sessions(self) -> SourceObservation:
+        """Read all visible sessions once and summarize them by agent id."""
+
+        cache_key = "sessions.list"
         cached = self.cache.fresh(cache_key)
         if cached:
             return cached
@@ -146,24 +183,33 @@ class OpenClawReader:
         if recent_failure:
             return recent_failure
         try:
-            raw = self._call("sessions.list", {"agentId": agent_id, "limit": 100})
+            raw = self._call("sessions.list", {"limit": 100})
             sessions = raw.get("sessions")
             if not isinstance(sessions, list):
                 raise ReaderError("OpenClaw sessions.list omitted sessions")
-            # Session keys and payloads are intentionally never copied or returned.
-            timestamps = [
-                stamp
-                for item in sessions
-                if isinstance(item, Mapping)
-                for stamp in [_timestamp(item.get("updatedAt"))]
-                if stamp is not None
-            ]
+            by_agent: dict[str, dict[str, Any]] = {}
+            for item in sessions:
+                if not isinstance(item, Mapping):
+                    continue
+                agent_id = self._session_agent_id(item)
+                stamp = self._session_timestamp(item)
+                if agent_id is None:
+                    continue
+                current = by_agent.setdefault(
+                    agent_id,
+                    {"agent_id": agent_id, "recent_session_at": None, "session_count": 0},
+                )
+                current["session_count"] += 1
+                if stamp is not None and (
+                    current["recent_session_at"] is None or stamp > current["recent_session_at"]
+                ):
+                    current["recent_session_at"] = stamp
             observation = SourceObservation.success(
                 "openclaw_sessions",
                 {
-                    "agent_id": agent_id,
-                    "recent_session_at": max(timestamps) if timestamps else None,
+                    "sessions_by_agent": by_agent,
                     "session_count": len(sessions),
+                    "agent_count": len(by_agent),
                 },
             )
             self.cache.put(cache_key, observation)
@@ -178,3 +224,49 @@ class OpenClawReader:
             )
             self.failure_cache.remember(cache_key, failure)
             return failure
+
+    def cached_agent_sessions(
+        self, reason: str = "live OpenClaw sessions were not queried"
+    ) -> SourceObservation:
+        return self._cached_or_unknown("sessions.list", "openclaw_sessions", reason)
+
+    def session_for_agent(
+        self,
+        agent_id: str,
+        sessions: SourceObservation | None = None,
+    ) -> SourceObservation:
+        if not _AGENT_ID.fullmatch(agent_id):
+            return SourceObservation.unknown("openclaw_sessions", "agent id is invalid")
+        observation = sessions if sessions is not None else self.list_agent_sessions()
+        if observation.data is None:
+            if observation.availability == "UNKNOWN":
+                return SourceObservation.unknown(
+                    "openclaw_sessions", observation.error or "session source unavailable"
+                )
+            return SourceObservation.unavailable(
+                "openclaw_sessions", observation.error or "session source unavailable"
+            )
+        by_agent = observation.data.get("sessions_by_agent")
+        if not isinstance(by_agent, Mapping):
+            return SourceObservation.unavailable(
+                "openclaw_sessions", "session source returned invalid grouped data"
+            )
+        raw = by_agent.get(agent_id)
+        data = dict(raw) if isinstance(raw, Mapping) else {
+            "agent_id": agent_id,
+            "recent_session_at": None,
+            "session_count": 0,
+        }
+        return SourceObservation(
+            "openclaw_sessions",
+            observation.availability,
+            data,
+            observation.observed_at,
+            observation.queried_at,
+            stale=observation.stale,
+            cache_hit=observation.cache_hit,
+            error=observation.error,
+        )
+
+    def recent_session(self, agent_id: str) -> SourceObservation:
+        return self.session_for_agent(agent_id)

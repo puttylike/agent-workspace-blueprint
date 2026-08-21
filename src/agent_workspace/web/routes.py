@@ -24,6 +24,7 @@ class SourceMeta(BaseModel):
     availability: str
     queried_at: str
     observed_at: str | None = None
+    last_success_at: str | None = None
     stale: bool = False
     message: str | None = None
 
@@ -62,6 +63,7 @@ class _Observation:
             "availability": self.availability,
             "queried_at": self.queried_at,
             "observed_at": self.observed_at,
+            "last_success_at": self.observed_at if self.stale else None,
             "stale": self.stale,
             "message": self.message,
         }
@@ -170,11 +172,17 @@ async def _observe(
     method = getattr(service, method_name, None) if service is not None else None
     if method is not None:
         try:
-            value = _public_value(await _invoke(method, *args))
+            source_timeout = getattr(request.app.state, "source_timeout_seconds", 8.0)
+            invocation = _invoke(method, *args)
+            value = _public_value(
+                await asyncio.wait_for(invocation, timeout=source_timeout)
+                if source_timeout
+                else await invocation
+            )
             observed_at = _utc_now()
             await cache.put(key, value, observed_at)
             return _Observation(value, "AVAILABLE", queried_at, observed_at)
-        except Exception:
+        except (TimeoutError, asyncio.TimeoutError, Exception):
             # Raw provider/command errors must not be reflected into logs or HTML.
             pass
     cached = await cache.get(key)
