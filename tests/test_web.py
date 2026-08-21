@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
+import time
 
 from fastapi.testclient import TestClient
 
@@ -79,6 +80,12 @@ class FakeStatusService:
         ]
 
 
+class SlowStatusService:
+    def agents(self):
+        time.sleep(0.2)
+        return [{"id": "late-agent"}]
+
+
 def _client(tmp_path: Path) -> tuple[TestClient, WikiIndex]:
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
@@ -149,6 +156,51 @@ def test_all_required_read_routes_and_no_write_routes(tmp_path: Path) -> None:
         assert client.put(forbidden).status_code == 405
         assert client.patch(forbidden).status_code == 405
         assert client.delete(forbidden).status_code == 405
+
+
+def test_cold_cache_source_timeout_returns_within_route_budget(tmp_path: Path) -> None:
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    app = create_app(status_service=SlowStatusService(), wiki_service=WikiIndex(knowledge, tmp_path / "wiki.db"))
+    app.state.source_timeout_seconds = 0.05
+    client = TestClient(app)
+
+    started = time.monotonic()
+    response = client.get("/api/v1/agents")
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 0.15
+    payload = response.json()
+    assert payload["items"] == []
+    assert payload["meta"]["availability"] == "UNAVAILABLE"
+
+
+def test_stale_cache_meta_includes_last_success_at(tmp_path: Path) -> None:
+    class FlakyStatusService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def agents(self):
+            self.calls += 1
+            if self.calls == 1:
+                return [{"id": "cached-agent"}]
+            raise RuntimeError("authorization: Bearer must-not-render")
+
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    app = create_app(status_service=FlakyStatusService(), wiki_service=WikiIndex(knowledge, tmp_path / "wiki.db"))
+    client = TestClient(app)
+
+    first = client.get("/api/v1/agents").json()
+    second_response = client.get("/api/v1/agents")
+    second = second_response.json()
+
+    assert second_response.status_code == 200
+    assert first["items"] == second["items"] == [{"id": "cached-agent", "name": "cached-agent", "exists": None, "status": "UNKNOWN", "last_activity_at": None, "role": None}]
+    assert second["meta"]["stale"] is True
+    assert second["meta"]["last_success_at"] == first["meta"]["observed_at"]
+    assert "must-not-render" not in second_response.text
 
 
 def test_markdown_is_sanitized_and_wiki_searches_fts5(tmp_path: Path) -> None:

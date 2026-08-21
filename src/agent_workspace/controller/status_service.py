@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from ..config import load_app_config
 from ..models import (
@@ -84,15 +86,19 @@ class StatusService:
         self,
         project: ProjectRecord,
         agent_observation: SourceObservation | None = None,
+        session_observation: SourceObservation | None = None,
     ) -> dict[str, Any]:
         git = self.git_reader.read(project)
         beads = self.beads_reader.read(project)
         github = self.github_reader.read(project)
-        agents = agent_observation or self.openclaw_reader.list_agents()
+        agents = agent_observation or self.openclaw_reader.cached_agents()
         agent_index = self._agent_index(agents)
         agent_present = project.agent_id in agent_index if agents.data is not None else None
         session = (
-            self.openclaw_reader.recent_session(project.agent_id)
+            self.openclaw_reader.session_for_agent(
+                project.agent_id,
+                session_observation or self.openclaw_reader.cached_agent_sessions(),
+            )
             if agent_present
             else SourceObservation.unknown("openclaw_sessions", "registered agent is not present")
         )
@@ -178,19 +184,54 @@ class StatusService:
 
     def projects(self) -> list[dict[str, Any]]:
         registry = self._registry()
-        agents = self.openclaw_reader.list_agents()
-        return [self._project(project, agents) for project in registry.projects]
+        agents = self.openclaw_reader.cached_agents()
+        sessions = self.openclaw_reader.cached_agent_sessions()
+        return [self._project(project, agents, sessions) for project in registry.projects]
 
     def project(self, project_id: str) -> dict[str, Any] | None:
         registry = self._registry()
         project = registry.get(project_id)
         if project is None:
             return None
-        return self._project(project, self.openclaw_reader.list_agents())
+        return self._project(
+            project,
+            self.openclaw_reader.cached_agents(),
+            self.openclaw_reader.cached_agent_sessions(),
+        )
+
+    def _openclaw_live_pair(self) -> tuple[SourceObservation, SourceObservation]:
+        """Fetch agent and session summaries concurrently with a small UI budget."""
+
+        timeout_seconds = float(getattr(self.openclaw_reader, "ui_timeout_seconds", 7.0))
+        deadline = time.monotonic() + timeout_seconds + 0.5
+        executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="agent-ops-openclaw")
+        futures = {
+            "agents": executor.submit(self.openclaw_reader.list_agents),
+            "sessions": executor.submit(self.openclaw_reader.list_agent_sessions),
+        }
+
+        def result(
+            name: str,
+            fallback: Callable[[str], SourceObservation],
+        ) -> SourceObservation:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                return futures[name].result(timeout=remaining)
+            except FutureTimeout:
+                return fallback(f"OpenClaw {name} lookup exceeded the UI budget")
+            except Exception as exc:
+                return fallback(redact_text(str(exc) or exc.__class__.__name__))
+
+        try:
+            agents = result("agents", self.openclaw_reader.cached_agents)
+            sessions = result("sessions", self.openclaw_reader.cached_agent_sessions)
+            return agents, sessions
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def agents(self) -> list[dict[str, Any]]:
         registry = self._registry()
-        observation = self.openclaw_reader.list_agents()
+        observation, sessions = self._openclaw_live_pair()
         source_agents = self._agent_index(observation)
         projects_by_agent: dict[str, list[str]] = {}
         for project in registry.projects:
@@ -198,7 +239,7 @@ class StatusService:
 
         results: list[dict[str, Any]] = []
         for agent_id, agent in sorted(source_agents.items()):
-            session = self.openclaw_reader.recent_session(agent_id)
+            session = self.openclaw_reader.session_for_agent(agent_id, sessions)
             session_data = _data(session)
             is_default = bool(agent.get("is_default"))
             explicitly_legacy = agent_id in self.config.openclaw.legacy_agents

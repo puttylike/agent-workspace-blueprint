@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+from threading import Lock
 
 from agent_workspace.controller.github_reader import GitHubReader
 from agent_workspace.controller.openclaw_reader import OpenClawReader
@@ -48,11 +50,59 @@ class StubOpenClaw:
             },
         )
 
-    def recent_session(self, agent_id: str):
+    def cached_agents(self):
+        return self.list_agents()
+
+    def list_agent_sessions(self):
         return SourceObservation.success(
             "openclaw_sessions",
-            {"agent_id": agent_id, "recent_session_at": "2030-01-01T00:00:00Z"},
+            {
+                "sessions_by_agent": {
+                    agent_id: {
+                        "agent_id": agent_id,
+                        "recent_session_at": "2030-01-01T00:00:00Z",
+                        "session_count": 1,
+                    }
+                    for agent_id in ("sample-lead", "workspace-manager", "legacy-default")
+                }
+            },
         )
+
+    def cached_agent_sessions(self):
+        return self.list_agent_sessions()
+
+    def session_for_agent(self, agent_id: str, sessions: SourceObservation | None = None):
+        observation = sessions or self.list_agent_sessions()
+        data = dict(observation.data or {})
+        by_agent = data.get("sessions_by_agent", {})
+        return SourceObservation.success(
+            "openclaw_sessions",
+            by_agent.get(
+                agent_id,
+                {"agent_id": agent_id, "recent_session_at": None, "session_count": 0},
+            ),
+        )
+
+
+class MethodRunner:
+    def __init__(self, by_method: dict[str, CommandResult], *, delay: float = 0.0) -> None:
+        self.by_method = dict(by_method)
+        self.delay = delay
+        self.calls: list[tuple[list[str], Path]] = []
+        self.timeout_seconds = 10.0
+        self.stdout_limit_bytes = 65_536
+        self.stderr_limit_bytes = 16_384
+        self._lock = Lock()
+
+    def run(self, argv: list[str], *, cwd: Path) -> CommandResult:
+        if self.delay:
+            time.sleep(self.delay)
+        with self._lock:
+            self.calls.append((list(argv), Path(cwd)))
+        method = argv[3]
+        if method not in self.by_method:
+            raise AssertionError(f"unexpected command invocation: {method}")
+        return self.by_method[method]
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -211,3 +261,197 @@ def test_openclaw_failure_falls_back_and_session_keys_never_escape() -> None:
     serialized = json.dumps(session.as_dict())
     assert "opaque" not in serialized
     assert "session" not in serialized.lower() or "openclaw_sessions" in serialized
+
+
+def test_status_service_fetches_all_sessions_once_for_four_agents(tmp_path, sample_project) -> None:
+    agents_payload = {
+        "defaultId": "main",
+        "agents": [
+            {"id": "main", "name": "Main"},
+            {"id": "manager", "name": "Manager"},
+            {"id": "ops-builder", "name": "Ops Builder"},
+            {"id": "sample-lead", "name": "Sample Lead"},
+        ],
+    }
+    sessions_payload = {
+        "sessions": [
+            {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_000_000},
+            {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_100_000},
+            {"agentRuntime": {"id": "manager"}, "updatedAt": 1_893_456_050_000},
+            {"agentRuntime": {"id": "ops-builder"}, "updatedAt": 1_893_456_025_000},
+        ]
+    }
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(0, json.dumps(agents_payload), ""),
+            "sessions.list": CommandResult(0, json.dumps(sessions_payload), ""),
+        }
+    )
+    reader = OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0)
+    service = StatusService(
+        _config(tmp_path),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=reader,
+    )
+
+    agents = service.agents()
+
+    assert {agent["id"] for agent in agents} == {
+        "main",
+        "manager",
+        "ops-builder",
+        "sample-lead",
+    }
+    assert next(agent for agent in agents if agent["id"] == "sample-lead")[
+        "recent_session_at"
+    ] == "2030-01-01T00:01:40Z"
+    methods = [call[0][3] for call in runner.calls]
+    assert methods.count("agents.list") == 1
+    assert methods.count("sessions.list") == 1
+    assert all("agentId" not in call[0][6] for call in runner.calls if call[0][3] == "sessions.list")
+
+
+def test_openclaw_groups_all_sessions_by_recent_agent_activity() -> None:
+    payload = {
+        "sessions": [
+            {"agentRuntime": {"id": "paper"}, "updatedAt": 1_893_456_000_000},
+            {"agentRuntime": {"id": "paper"}, "lastActivityAt": 1_893_456_500_000},
+            {"agentRuntime": {"id": "manager"}, "updatedAt": 1_893_456_100_000},
+            {
+                "agentRuntime": {"id": "paper"},
+                "key": ":".join(("agent", "paper", "dashboard", "must-not-escape")),
+                "updatedAt": 1_893_456_250_000,
+            },
+        ]
+    }
+    runner = MethodRunner({"sessions.list": CommandResult(0, json.dumps(payload), "")})
+    reader = OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0)
+
+    sessions = reader.list_agent_sessions()
+    paper = reader.session_for_agent("paper", sessions)
+    manager = reader.session_for_agent("manager", sessions)
+    serialized = json.dumps(sessions.as_dict())
+
+    assert paper.data == {
+        "agent_id": "paper",
+        "recent_session_at": "2030-01-01T00:08:20Z",
+        "session_count": 3,
+    }
+    assert manager.data["recent_session_at"] == "2030-01-01T00:01:40Z"
+    assert "must-not-escape" not in serialized
+    assert len(runner.calls) == 1
+
+
+def test_agents_list_timeout_returns_registered_agents_without_live_source(tmp_path, sample_project) -> None:
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(1, "", "", timed_out=True),
+            "sessions.list": CommandResult(1, "", "", timed_out=True),
+        }
+    )
+    service = StatusService(
+        _config(tmp_path),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0),
+    )
+
+    agents = service.agents()
+
+    assert agents == [
+        {
+            "id": "sample-lead",
+            "name": None,
+            "model": None,
+            "exists": None,
+            "is_default": False,
+            "role": "PROJECT_LEAD",
+            "projects": ["sample-paper"],
+            "recent_session_at": None,
+            "availability": "UNAVAILABLE",
+            "session_source": None,
+        }
+    ]
+
+
+def test_sessions_timeout_keeps_agent_list_and_marks_sessions_unavailable(tmp_path, sample_project) -> None:
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(
+                0,
+                json.dumps({"agents": [{"id": "sample-lead", "name": "Sample Lead"}]}),
+                "",
+            ),
+            "sessions.list": CommandResult(1, "", "", timed_out=True),
+        }
+    )
+    service = StatusService(
+        _config(tmp_path),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0),
+    )
+
+    agents = service.agents()
+
+    assert agents[0]["id"] == "sample-lead"
+    assert agents[0]["recent_session_at"] is None
+    assert agents[0]["session_source"]["availability"] == "UNAVAILABLE"
+
+
+def test_openclaw_last_success_cache_exposes_stale_timestamp() -> None:
+    runner = FakeRunner(
+        [
+            CommandResult(
+                0,
+                json.dumps(
+                    {"sessions": [{"agentRuntime": {"id": "paper"}, "updatedAt": 1_893_456_000_000}]}
+                ),
+                "",
+            ),
+            CommandResult(1, "", "gateway unavailable"),
+        ]
+    )
+    reader = OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0)
+
+    first = reader.list_agent_sessions()
+    second = reader.list_agent_sessions()
+    rendered = second.as_dict()
+
+    assert first.availability == "AVAILABLE"
+    assert second.availability == "UNAVAILABLE"
+    assert second.stale is True
+    assert rendered["observed_at"] == first.observed_at
+    assert second.data == first.data
+
+
+def test_malformed_session_items_do_not_fail_agent_endpoint(tmp_path, sample_project) -> None:
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "agents": [
+                            {"id": "sample-lead", "name": "Sample Lead"},
+                            {"id": "../bad", "name": "Bad"},
+                        ]
+                    }
+                ),
+                "",
+            ),
+            "sessions.list": CommandResult(
+                0,
+                json.dumps({"sessions": ["bad", {"agentRuntime": {"id": "../bad"}}]}),
+                "",
+            ),
+        }
+    )
+    service = StatusService(
+        _config(tmp_path),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0),
+    )
+
+    agents = service.agents()
+
+    assert [agent["id"] for agent in agents] == ["sample-lead"]
+    assert agents[0]["recent_session_at"] is None
