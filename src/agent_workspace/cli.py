@@ -17,6 +17,21 @@ def _json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
+def _text_plan(value: dict[str, Any]) -> None:
+    print(f"Project: {value['display_name']} ({value['project_id']})")
+    print(f"Type: {value['type']}")
+    print(f"Visibility: {value['visibility']}")
+    print(f"Workspace: {value['proposed_workspace']}")
+    print(f"Repository: {value['proposed_github_repository']['full_name']}")
+    print(
+        "Lead: "
+        f"{value['proposed_lead']['display_name']} "
+        f"({value['proposed_lead']['agent_id']}, {value['proposed_lead']['role']})"
+    )
+    print(f"Beads: {value['beads']['enabled']} - {value['beads']['reason']}")
+    print(f"Executable: {value['executable']}")
+
+
 def _config_path(value: str | None) -> Path:
     candidate = value or os.environ.get("AWC_CONFIG") or os.environ.get(
         "AGENT_OPS_CONFIG"
@@ -42,6 +57,23 @@ def build_parser() -> argparse.ArgumentParser:
     project_commands.add_parser("list", help="list registered projects")
     show = project_commands.add_parser("show", help="show one registered project")
     show.add_argument("project_id")
+    plan = project_commands.add_parser("plan", help="plan a project without creating it")
+    plan.add_argument("--name", required=True, help="project display name")
+    plan.add_argument(
+        "--type",
+        required=True,
+        choices=("paper", "blog", "quant", "app", "contest", "misc"),
+        dest="project_type",
+        help="project type",
+    )
+    plan.add_argument("--goal", required=True, help="project goal")
+    plan.add_argument(
+        "--visibility",
+        choices=("private", "public"),
+        default="private",
+        help="planned repository visibility",
+    )
+    plan.add_argument("--json", action="store_true", help="emit a stable JSON plan")
 
     agents = commands.add_parser("agents", help="inspect configured agents")
     agent_commands = agents.add_subparsers(dest="agents_command", required=True)
@@ -65,12 +97,22 @@ def _load(path: Path) -> tuple[Any, Any]:
     return config, StatusService.from_config(config)
 
 
+def _load_config(path: Path) -> Any:
+    from .config import load_app_config
+
+    return load_app_config(path)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         config_path = _config_path(args.config)
-        config, service = _load(config_path)
+        if args.command == "projects" and args.projects_command == "plan":
+            config = _load_config(config_path)
+            service = None
+        else:
+            config, service = _load(config_path)
     except Exception as exc:
         # Configuration errors are deliberately generic: private paths and
         # credentials from lower layers are never reflected to the terminal.
@@ -82,9 +124,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.get("status") == "PASS" else 1
 
     if args.command == "projects":
+        if args.projects_command == "plan":
+            from .controller.project_planner import (
+                ProjectPlanError,
+                ProjectPlanRequest,
+                plan_project,
+            )
+            from .models import SecurityBoundaryError
+
+            try:
+                result = plan_project(
+                    config,
+                    ProjectPlanRequest(
+                        name=args.name,
+                        project_type=args.project_type,
+                        goal=args.goal,
+                        visibility=args.visibility,
+                    ),
+                )
+            except (ProjectPlanError, SecurityBoundaryError) as exc:
+                message = {"error": "invalid_project_plan", "reason": str(exc)}
+                if args.json:
+                    _json(message)
+                else:
+                    print(f"awc: {message['error']}: {message['reason']}")
+                return 2
+            if args.json:
+                _json(result)
+            else:
+                _text_plan(result)
+            return 0
         if args.projects_command == "list":
+            assert service is not None
             _json(service.projects())
             return 0
+        assert service is not None
         project = service.project(args.project_id)
         if project is None:
             _json({"error": "project_not_found", "project_id": args.project_id})

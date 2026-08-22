@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from agent_workspace.cli import main
+from agent_workspace.config import load_app_config
+from agent_workspace.controller.project_planner import (
+    PROJECT_TYPES,
+    ProjectPlanError,
+    ProjectPlanRequest,
+    plan_project,
+    slugify,
+)
+
+
+def _write_config(tmp_path: Path) -> Path:
+    workspace = tmp_path / "schema-paper"
+    workspace.mkdir()
+    (workspace / ".beads").mkdir()
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    runtime = tmp_path / "runtime.db"
+    beads = tmp_path / "bd"
+    beads.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    beads.chmod(0o700)
+    registry = tmp_path / "projects.yaml"
+    registry.write_text(
+        f"""version: 1
+projects:
+  - id: paper-schema-virtualization
+    name: Schema Virtualization Paper
+    type: paper
+    lifecycle: active
+    phase: WRITING
+    agent_id: paper
+    workspace: {workspace}
+    git:
+      repository: example/schema-paper
+      canonical_branch: main
+      active_branch: research/draft
+      draft_pr: 17
+    beads:
+      binary: {beads}
+      directory: {workspace / '.beads'}
+    policies:
+      manager_write_access: false
+      direct_merge: false
+      public_publish: approval_required
+""",
+        encoding="utf-8",
+    )
+    config = tmp_path / "agent-ops.yaml"
+    config.write_text(
+        f"""version: 1
+mode: read_only
+listen_host: 127.0.0.1
+listen_port: 3001
+project_registry: {registry}
+knowledge_root: {knowledge}
+public_blueprint_path: {tmp_path}
+runtime_sqlite_cache: {runtime}
+commands:
+  git: /bin/true
+  gh: /bin/true
+  openclaw: /bin/true
+openclaw:
+  access_method: local_gateway_rpc
+  manager_agent_id: manager
+  legacy_agents:
+    - main
+  expected_agents:
+    - id: paper
+      display_name: Paper Lead
+      role: PROJECT_LEAD
+""",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _plan(
+    tmp_path: Path,
+    *,
+    name: str = "Blog Automation",
+    project_type: str = "blog",
+    goal: str = "Automate topic research and content production.",
+    visibility: str = "private",
+) -> dict:
+    config = load_app_config(_write_config(tmp_path))
+    return plan_project(
+        config,
+        ProjectPlanRequest(
+            name=name,
+            project_type=project_type,
+            goal=goal,
+            visibility=visibility,
+        ),
+    )
+
+
+@pytest.mark.parametrize("project_type", PROJECT_TYPES)
+def test_project_types_build_normal_plan(tmp_path: Path, project_type: str) -> None:
+    goal = "Build a prototype" if project_type == "contest" else "Long-running project research"
+    result = _plan(tmp_path, project_type=project_type, goal=goal)
+
+    assert result["type"] == project_type
+    assert result["executable"] is False
+    assert result["proposed_lead"]["role"] == "PROJECT_LEAD"
+    assert result["duplicate_decision"]["create_new"] is True
+
+
+def test_default_visibility_is_private(tmp_path: Path) -> None:
+    config = load_app_config(_write_config(tmp_path))
+
+    result = plan_project(
+        config,
+        ProjectPlanRequest(
+            name="Private App",
+            project_type="app",
+            goal="Build a small application.",
+        ),
+    )
+
+    assert result["visibility"] == "private"
+    assert result["proposed_github_repository"]["private"] is True
+
+
+def test_public_visibility_requires_approval(tmp_path: Path) -> None:
+    result = _plan(tmp_path, visibility="public")
+
+    assert result["visibility"] == "public"
+    assert any("Public visibility" in item for item in result["warnings"])
+    assert any("public" in item.lower() for item in result["approvals_required"])
+
+
+def test_slug_normalization() -> None:
+    assert slugify(" Blog Automation!! ") == "blog-automation"
+    assert slugify("QUANT 2026 Alpha") == "quant-2026-alpha"
+
+
+def test_invalid_type_is_rejected(tmp_path: Path) -> None:
+    config = load_app_config(_write_config(tmp_path))
+
+    with pytest.raises(ProjectPlanError):
+        plan_project(
+            config,
+            ProjectPlanRequest(
+                name="Unsupported",
+                project_type="invalid",
+                goal="Do something.",
+            ),
+        )
+
+
+def test_path_traversal_input_is_rejected(tmp_path: Path) -> None:
+    config = load_app_config(_write_config(tmp_path))
+
+    with pytest.raises(ProjectPlanError):
+        plan_project(
+            config,
+            ProjectPlanRequest(
+                name="../escape",
+                project_type="misc",
+                goal="Do something.",
+            ),
+        )
+
+
+def test_duplicate_project_detection(tmp_path: Path) -> None:
+    result = _plan(
+        tmp_path,
+        name="schema-paper",
+        project_type="paper",
+        goal="Continue the current paper.",
+    )
+
+    assert result["duplicate_decision"]["create_new"] is False
+    assert result["duplicate_decision"]["matched_project_id"] == "paper-schema-virtualization"
+
+
+def test_existing_paper_similarity_is_reported(tmp_path: Path) -> None:
+    result = _plan(
+        tmp_path,
+        name="Schema Virtualization Study",
+        project_type="paper",
+        goal="Write another schema virtualization paper.",
+    )
+
+    assert result["duplicate_decision"]["create_new"] is False
+    assert result["duplicate_candidates"][0]["project_id"] == "paper-schema-virtualization"
+
+
+def test_secret_like_input_is_rejected(tmp_path: Path) -> None:
+    config = load_app_config(_write_config(tmp_path))
+
+    with pytest.raises(ProjectPlanError):
+        plan_project(
+            config,
+            ProjectPlanRequest(
+                name="Secret Blog",
+                project_type="blog",
+                goal="Use token abc123 in the plan.",
+            ),
+        )
+
+
+def test_quant_policy_forbids_live_trading_without_approval(tmp_path: Path) -> None:
+    result = _plan(tmp_path, project_type="quant", goal="Research a strategy.")
+
+    assert result["beads"]["enabled"] is True
+    assert any("Live trading" in item for item in result["approvals_required"])
+    assert any("broker accounts" in item for item in result["warnings"])
+
+
+def test_blog_policy_requires_external_publishing_approval(tmp_path: Path) -> None:
+    result = _plan(
+        tmp_path,
+        project_type="blog",
+        goal="Automate a long-running content pipeline.",
+    )
+
+    assert result["beads"]["enabled"] is True
+    assert any("external publishing" in item for item in result["approvals_required"])
+
+
+def test_plan_does_not_create_progress(tmp_path: Path) -> None:
+    result = _plan(tmp_path)
+    encoded = json.dumps(result)
+
+    assert "progress_percent" not in encoded
+    assert '"progress"' not in encoded
+
+
+def test_plan_has_no_side_effects(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    config = load_app_config(config_path)
+
+    result = plan_project(
+        config,
+        ProjectPlanRequest(
+            name="Side Effect Check",
+            project_type="app",
+            goal="Plan only.",
+        ),
+    )
+    after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+
+    assert before == after
+    assert result["registry_entry"]["lifecycle"] == "planned"
+    assert result["proposed_github_repository"]["create"] is False
+    assert result["proposed_lead"]["create"] is False
+
+
+def test_json_output_schema_is_stable(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config_path = _write_config(tmp_path)
+
+    code = main(
+        [
+            "--config",
+            str(config_path),
+            "projects",
+            "plan",
+            "--name",
+            "Blog Automation",
+            "--type",
+            "blog",
+            "--goal",
+            "Automate topic research and content production.",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert list(payload) == [
+        "approvals_required",
+        "beads",
+        "display_name",
+        "duplicate_candidates",
+        "duplicate_decision",
+        "executable",
+        "goal",
+        "knowledge_path",
+        "planned_files",
+        "project_id",
+        "proposed_github_repository",
+        "proposed_lead",
+        "proposed_workspace",
+        "registry_entry",
+        "resource_policy",
+        "slug",
+        "type",
+        "visibility",
+        "warnings",
+    ]
+    assert payload["resource_policy"]["execution_mode"] == "sequential"
+    assert payload["resource_policy"]["max_heavy_agents"] == 1
+    assert payload["resource_policy"]["subagents"] == "disabled_by_default"
+
+
+def test_public_fixtures_do_not_contain_private_identifiers() -> None:
+    root = Path(__file__).parent / "fixtures"
+    forbidden = tuple(value for value in (os.environ.get("HOME"),) if value)
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix in {".py", ".md", ".yaml", ".yml", ".json"}:
+            text = path.read_text(encoding="utf-8")
+            for value in forbidden:
+                assert value not in text
+            assert "agent:sample-lead:" not in text
