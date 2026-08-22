@@ -17,6 +17,59 @@ from agent_workspace.controller.project_planner import (
 )
 
 
+def _venture_defaults_yaml() -> str:
+    return """
+venture_defaults:
+  strategy: local_first
+  lifecycle:
+    stages:
+      - DISCOVER
+      - VALIDATE
+      - FRONTIER_PROTOTYPE
+      - NORMALIZE
+      - LOCAL_PARITY
+      - SHADOW_RUN
+      - AUTOMATED
+      - MONITORING
+      - SCALE
+      - RETIRE
+    initial_stage: DISCOVER
+  monetization:
+    preferred: affiliate
+    free_user_access_preferred: true
+  frontier:
+    allowed_uses:
+      - prototype
+      - quality_baseline
+    subscription: existing_only
+    monthly_cash_budget_krw: 0
+  local:
+    runner_required: true
+    runner: null
+    model: null
+  quality_gate:
+    required: true
+    metrics: []
+  shadow_run_days: null
+  schedule: null
+  success_metrics: []
+  kill_criteria: []
+  risks:
+    platform: []
+    licensing: []
+  approvals:
+    required:
+      - external_publish
+      - account_creation
+      - payment
+      - affiliate_application
+      - production_deploy
+      - personal_data_collection
+    prohibited:
+      - live_trading
+"""
+
+
 def _write_config(tmp_path: Path) -> Path:
     workspace = tmp_path / "schema-paper"
     workspace.mkdir()
@@ -76,6 +129,7 @@ openclaw:
     - id: paper
       display_name: Paper Lead
       role: PROJECT_LEAD
+{_venture_defaults_yaml()}
 """,
         encoding="utf-8",
     )
@@ -227,6 +281,148 @@ def test_blog_policy_requires_external_publishing_approval(tmp_path: Path) -> No
     assert any("external publishing" in item for item in result["approvals_required"])
 
 
+def test_venture_defaults_parse_private_config(tmp_path: Path) -> None:
+    config = load_app_config(_write_config(tmp_path))
+    defaults = config.venture_defaults
+
+    assert defaults is not None
+    assert defaults.strategy == "local_first"
+    assert defaults.lifecycle.initial_stage == "DISCOVER"
+    assert defaults.monetization.preferred == "affiliate"
+    assert defaults.frontier.monthly_cash_budget_krw == 0
+    assert defaults.local.runner_required is True
+    assert defaults.quality_gate.required is True
+    assert defaults.shadow_run_days is None
+    assert defaults.approvals.prohibited == ("live_trading",)
+
+
+def test_venture_lifecycle_stage_validation(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("initial_stage: DISCOVER", "initial_stage: IDEA"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="initial_stage"):
+        load_app_config(config_path)
+
+
+def test_venture_negative_budget_is_rejected(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("monthly_cash_budget_krw: 0", "monthly_cash_budget_krw: -1"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="monthly_cash_budget_krw"):
+        load_app_config(config_path)
+
+
+def test_venture_bad_approval_value_is_rejected(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("external_publish", "unreviewed_launch"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="approvals.required"):
+        load_app_config(config_path)
+
+
+def test_venture_unknown_field_is_rejected(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  strategy: local_first",
+            "  strategy: local_first\n  unexpected: true",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="unknown fields"):
+        load_app_config(config_path)
+
+
+def test_venture_type_builds_local_first_plan(tmp_path: Path) -> None:
+    result = _plan(
+        tmp_path,
+        name="Local-First Revenue Lab",
+        project_type="venture",
+        goal="Find and validate local-first monetization opportunities.",
+    )
+    venture = result["venture"]
+
+    assert result["project_id"] == "local-first-revenue-lab"
+    assert result["phase"] == "DISCOVER"
+    assert result["registry_entry"]["phase"] == "DISCOVER"
+    assert result["registry_entry"]["venture"]["strategy"] == "local_first"
+    assert result["proposed_lead"]["role"] == "PROJECT_LEAD"
+    assert result["proposed_lead"]["specialization"] == "VENTURE"
+    assert result["proposed_lead"]["display_name"].endswith("Venture Lead")
+    assert result["beads"]["enabled"] is True
+    assert venture["strategy"] == "local_first"
+    assert venture["lifecycle_stage"] == "DISCOVER"
+    assert venture["monetization_model"] == "affiliate"
+    assert venture["frontier_policy"]["allowed_uses"] == ["prototype", "quality_baseline"]
+    assert venture["frontier_policy"]["subscription"] == "existing_only"
+    assert venture["frontier_policy"]["additional_monthly_cash_budget_krw"] == 0
+    assert venture["local_runner_required"] is True
+    assert venture["local_model"] is None
+    assert venture["quality_gate"] == {"required": True, "metrics": []}
+    assert venture["shadow_run_days"] is None
+    assert venture["success_metrics"] == []
+    assert venture["kill_criteria"] == []
+    assert "live_trading" in venture["approvals"]["prohibited"]
+    assert result["resource_policy"]["execution_mode"] == "sequential"
+    assert result["resource_policy"]["max_heavy_agents"] == 1
+    assert result["executable"] is False
+
+
+def test_venture_missing_user_inputs_are_reported(tmp_path: Path) -> None:
+    result = _plan(tmp_path, name="Local Venture", project_type="venture")
+
+    assert set(result["missing_user_inputs"]) == {
+        "local_runner",
+        "local_model",
+        "quality_gate.metrics",
+        "shadow_run_days",
+        "schedule",
+        "success_metrics",
+        "kill_criteria",
+    }
+
+
+def test_venture_required_approvals_are_listed(tmp_path: Path) -> None:
+    result = _plan(tmp_path, name="Local Venture", project_type="venture")
+    text = " ".join(result["approvals_required"]).lower()
+
+    for phrase in (
+        "external publishing",
+        "account creation",
+        "payment",
+        "affiliate application",
+        "production deployment",
+        "personal data collection",
+    ):
+        assert phrase in text
+    assert "live trading is prohibited" in text
+
+
+def test_venture_plan_does_not_invent_business_metrics(tmp_path: Path) -> None:
+    result = _plan(tmp_path, name="Local Venture", project_type="venture")
+    encoded = json.dumps(result)
+
+    for forbidden in (
+        "progress_percent",
+        '"progress"',
+        "success_probability",
+        "traffic_projection",
+        "revenue_projection",
+        "expected_revenue",
+    ):
+        assert forbidden not in encoded
+
+
 def test_plan_does_not_create_progress(tmp_path: Path) -> None:
     result = _plan(tmp_path)
     encoded = json.dumps(result)
@@ -254,6 +450,25 @@ def test_plan_has_no_side_effects(tmp_path: Path) -> None:
     assert result["registry_entry"]["lifecycle"] == "planned"
     assert result["proposed_github_repository"]["create"] is False
     assert result["proposed_lead"]["create"] is False
+
+
+def test_venture_plan_has_no_side_effects(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    config = load_app_config(config_path)
+
+    result = plan_project(
+        config,
+        ProjectPlanRequest(
+            name="Local Venture",
+            project_type="venture",
+            goal="Plan only.",
+        ),
+    )
+    after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+
+    assert before == after
+    assert result["executable"] is False
 
 
 def test_json_output_schema_is_stable(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

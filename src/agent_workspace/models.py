@@ -73,6 +73,66 @@ class OpenClawConfig:
 
 
 @dataclass(frozen=True)
+class VentureLifecycleConfig:
+    stages: tuple[str, ...]
+    initial_stage: str
+
+
+@dataclass(frozen=True)
+class VentureMonetizationConfig:
+    preferred: str
+    free_user_access_preferred: bool
+
+
+@dataclass(frozen=True)
+class VentureFrontierConfig:
+    allowed_uses: tuple[str, ...]
+    subscription: str
+    monthly_cash_budget_krw: int | None
+
+
+@dataclass(frozen=True)
+class VentureLocalConfig:
+    runner_required: bool
+    runner: str | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True)
+class VentureQualityGateConfig:
+    required: bool
+    metrics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VentureRiskConfig:
+    platform: tuple[str, ...] = ()
+    licensing: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VentureApprovalConfig:
+    required: tuple[str, ...] = ()
+    prohibited: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VentureDefaultsConfig:
+    strategy: str
+    lifecycle: VentureLifecycleConfig
+    monetization: VentureMonetizationConfig
+    frontier: VentureFrontierConfig
+    local: VentureLocalConfig
+    quality_gate: VentureQualityGateConfig
+    shadow_run_days: int | None
+    schedule: str | None
+    success_metrics: tuple[str, ...]
+    kill_criteria: tuple[str, ...]
+    risks: VentureRiskConfig
+    approvals: VentureApprovalConfig
+
+
+@dataclass(frozen=True)
 class AppConfig:
     version: int
     mode: str
@@ -86,6 +146,7 @@ class AppConfig:
     cache_ttl_seconds: int
     openclaw: OpenClawConfig
     source_path: Path
+    venture_defaults: VentureDefaultsConfig | None = None
 
     @property
     def sqlite_cache(self) -> Path:
