@@ -58,10 +58,18 @@ class CommandConfig:
 
 
 @dataclass(frozen=True)
+class ExpectedAgentConfig:
+    id: str
+    display_name: str | None = None
+    role: str | None = None
+
+
+@dataclass(frozen=True)
 class OpenClawConfig:
     access_method: str
     legacy_agents: tuple[str, ...] = ()
     manager_agent_id: str | None = None
+    expected_agents: tuple[ExpectedAgentConfig, ...] = ()
 
 
 @dataclass(frozen=True)

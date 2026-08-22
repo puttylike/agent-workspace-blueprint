@@ -6,6 +6,7 @@ import time
 
 from fastapi.testclient import TestClient
 
+from agent_workspace.controller.status_service import AgentRoster
 from agent_workspace.web.app import create_app
 from agent_workspace.web.wiki import WikiIndex, render_markdown
 
@@ -15,7 +16,7 @@ class FakeStatusService:
         self._project = {
             "id": "sample-paper",
             "name": "Sample Paper",
-            "type": "paper",
+            "type": "article",
             "lifecycle": "active",
             "phase": "WRITING",
             "agent_id": "sample-lead",
@@ -84,6 +85,30 @@ class SlowStatusService:
     def agents(self):
         time.sleep(0.2)
         return [{"id": "late-agent"}]
+
+
+class FallbackRosterService:
+    def agents(self):
+        return AgentRoster(
+            [
+                {
+                    "id": "sample-lead",
+                    "role": "PROJECT_LEAD",
+                    "exists": None,
+                    "availability": "UNAVAILABLE",
+                    "live_confirmed": False,
+                    "recent_session_at": None,
+                }
+            ],
+            {
+                "availability": "UNAVAILABLE",
+                "queried_at": "2030-01-01T00:00:00Z",
+                "observed_at": None,
+                "last_success_at": None,
+                "stale": False,
+                "message": "Live source unavailable; showing configured agents.",
+            },
+        )
 
 
 def _client(tmp_path: Path) -> tuple[TestClient, WikiIndex]:
@@ -174,6 +199,26 @@ def test_cold_cache_source_timeout_returns_within_route_budget(tmp_path: Path) -
     payload = response.json()
     assert payload["items"] == []
     assert payload["meta"]["availability"] == "UNAVAILABLE"
+
+
+def test_agent_roster_fallback_meta_is_not_reported_available(tmp_path: Path) -> None:
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    app = create_app(
+        status_service=FallbackRosterService(),
+        wiki_service=WikiIndex(knowledge, tmp_path / "wiki.db"),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/v1/agents")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["meta"]["availability"] == "UNAVAILABLE"
+    assert payload["meta"]["stale"] is False
+    assert payload["meta"]["message"]
+    assert payload["items"][0]["id"] == "sample-lead"
+    assert payload["items"][0]["live_confirmed"] is False
 
 
 def test_stale_cache_meta_includes_last_success_at(tmp_path: Path) -> None:
