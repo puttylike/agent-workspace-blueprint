@@ -111,6 +111,66 @@ class FallbackRosterService:
         )
 
 
+class ExpectedUnknownRosterService:
+    def agents(self):
+        roles = (
+            ("legacy-default", "Legacy Default", "LEGACY"),
+            ("workspace-manager", "Workspace Manager", "MANAGER"),
+            ("workspace-builder", "Workspace Builder", "BUILDER"),
+            ("sample-lead", "Sample Lead", "PROJECT_LEAD"),
+        )
+        return AgentRoster(
+            [
+                {
+                    "id": agent_id,
+                    "name": name,
+                    "role": role,
+                    "exists": None,
+                    "availability": "UNKNOWN",
+                    "live_confirmed": False,
+                    "expected": True,
+                    "recent_session_at": None,
+                }
+                for agent_id, name, role in roles
+            ],
+            {
+                "availability": "UNKNOWN",
+                "queried_at": "2030-01-01T00:00:00Z",
+                "observed_at": None,
+                "last_success_at": None,
+                "stale": False,
+                "message": "Live source unavailable; showing configured agents.",
+            },
+        )
+
+
+class AvailableLiveAgentService:
+    def agents(self):
+        return AgentRoster(
+            [
+                {
+                    "id": "sample-lead",
+                    "name": "Sample Lead",
+                    "role": "PROJECT_LEAD",
+                    "exists": True,
+                    "status": "OPERATIONAL",
+                    "availability": "AVAILABLE",
+                    "live_confirmed": True,
+                    "expected": True,
+                    "recent_session_at": "2030-01-01T00:00:00Z",
+                }
+            ],
+            {
+                "availability": "AVAILABLE",
+                "queried_at": "2030-01-01T00:00:00Z",
+                "observed_at": "2030-01-01T00:00:00Z",
+                "last_success_at": None,
+                "stale": False,
+                "message": None,
+            },
+        )
+
+
 def _client(tmp_path: Path) -> tuple[TestClient, WikiIndex]:
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
@@ -219,6 +279,74 @@ def test_agent_roster_fallback_meta_is_not_reported_available(tmp_path: Path) ->
     assert payload["meta"]["message"]
     assert payload["items"][0]["id"] == "sample-lead"
     assert payload["items"][0]["live_confirmed"] is False
+
+
+def test_expected_unknown_agents_render_as_html_cards(tmp_path: Path) -> None:
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    app = create_app(
+        status_service=ExpectedUnknownRosterService(),
+        wiki_service=WikiIndex(knowledge, tmp_path / "wiki.db"),
+    )
+    client = TestClient(app)
+
+    api = client.get("/api/v1/agents")
+    page = client.get("/agents")
+
+    assert api.status_code == 200
+    assert page.status_code == 200
+    payload = api.json()
+    assert payload["meta"]["availability"] == "UNKNOWN"
+    assert [agent["id"] for agent in payload["items"]] == [
+        "legacy-default",
+        "workspace-manager",
+        "workspace-builder",
+        "sample-lead",
+    ]
+    assert all(agent["exists"] is None for agent in payload["items"])
+    assert all(agent["expected"] is True for agent in payload["items"])
+    assert all(agent["live_confirmed"] is False for agent in payload["items"])
+    assert all(agent["last_activity_at"] is None for agent in payload["items"])
+
+    html = page.text
+    assert html.count('class="card agent-card"') == 4
+    assert "<strong>UNKNOWN</strong>" in html
+    for agent_id, role in (
+        ("legacy-default", "LEGACY"),
+        ("workspace-manager", "MANAGER"),
+        ("workspace-builder", "BUILDER"),
+        ("sample-lead", "PROJECT_LEAD"),
+    ):
+        assert f'data-agent-id="{agent_id}"' in html
+        assert f'<dd class="mono">{agent_id}</dd>' in html
+        assert role in html
+    assert html.count('<span class="phase">UNKNOWN</span>') == 4
+    assert html.count('<span class="state-warn">false</span>') == 4
+    assert html.count("확인되지 않음") == 4
+    assert "Recent agent activity" not in html
+    assert "2030-01-01T00:00:00Z</time></dd></div>" not in html
+
+
+def test_available_live_agent_rendering_is_preserved(tmp_path: Path) -> None:
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    app = create_app(
+        status_service=AvailableLiveAgentService(),
+        wiki_service=WikiIndex(knowledge, tmp_path / "wiki.db"),
+    )
+    client = TestClient(app)
+
+    page = client.get("/agents")
+
+    assert page.status_code == 200
+    html = page.text
+    assert 'data-agent-id="sample-lead"' in html
+    assert "PROJECT_LEAD" in html
+    assert '<span class="phase">OPERATIONAL</span>' in html
+    assert '<span class="state-good">YES</span>' in html
+    assert '<span class="state-good">true</span>' in html
+    assert 'datetime="2030-01-01T00:00:00Z"' in html
+    assert "확인되지 않음" not in html
 
 
 def test_stale_cache_meta_includes_last_success_at(tmp_path: Path) -> None:
