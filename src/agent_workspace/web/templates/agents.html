@@ -5,12 +5,13 @@
   {{ source_notice(source) }}
   <section class="card-grid compact-cards" aria-label="Agent list">
     {% for agent in agents %}
-      <article class="card">
+      <article class="card agent-card" data-agent-id="{{ agent.id }}">
         <div class="card-heading"><div><p class="eyebrow">{{ agent.role or 'agent' }}</p><h2>{{ agent.name }}</h2></div><span class="phase">{{ agent.status }}</span></div>
         <dl class="detail-list">
           <div><dt>Agent id</dt><dd class="mono">{{ agent.id }}</dd></div>
           <div><dt>Configured</dt><dd>{% if agent.exists is sameas true %}<span class="state-good">YES</span>{% elif agent.exists is sameas false %}<span class="state-warn">NO</span>{% else %}<span class="unknown">UNKNOWN</span>{% endif %}</dd></div>
-          <div><dt>Last activity</dt><dd>{% if agent.last_activity_at %}<time datetime="{{ agent.last_activity_at }}" data-relative-time>{{ agent.last_activity_at }}</time>{% else %}<span class="unknown">UNKNOWN</span>{% endif %}</dd></div>
+          <div><dt>Live confirmed</dt><dd>{% if agent.live_confirmed is sameas true %}<span class="state-good">true</span>{% elif agent.live_confirmed is sameas false %}<span class="state-warn">false</span>{% else %}<span class="unknown">UNKNOWN</span>{% endif %}</dd></div>
+          <div><dt>Last activity</dt><dd>{% if agent.last_activity_at %}<time datetime="{{ agent.last_activity_at }}" data-relative-time>{{ agent.last_activity_at }}</time>{% else %}<span class="unknown">확인되지 않음</span>{% endif %}</dd></div>
         </dl>
       </article>
     {% else %}<div class="empty-state"><h2>No agent data available</h2><p>The runtime reader may be unavailable.</p></div>{% endfor %}
