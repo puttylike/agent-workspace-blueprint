@@ -14,12 +14,14 @@ from .models import (
     AppConfig,
     CommandConfig,
     ConfigurationError,
+    ExpectedAgentConfig,
     OpenClawConfig,
     RuntimeConfig,
 )
 
 _MAX_CONFIG_BYTES = 1_048_576
 _AGENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_AGENT_ROLE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -71,6 +73,46 @@ def _load_yaml(path: Path) -> Mapping[str, Any]:
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ConfigurationError(f"could not parse configuration: {exc.__class__.__name__}") from exc
     return _mapping(parsed, "configuration")
+
+
+def _expected_agents(value: Any) -> tuple[ExpectedAgentConfig, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigurationError("openclaw.expected_agents must be a list")
+    agents: list[ExpectedAgentConfig] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        agent = _mapping(item, f"openclaw.expected_agents[{index}]")
+        agent_id = agent.get("id")
+        if not isinstance(agent_id, str) or not _AGENT_ID.fullmatch(agent_id):
+            raise ConfigurationError("openclaw.expected_agents.id must be a valid agent id")
+        if agent_id in seen:
+            raise ConfigurationError("openclaw.expected_agents contains duplicate ids")
+        seen.add(agent_id)
+
+        display_name = agent.get("display_name", agent.get("name"))
+        if display_name is not None and (
+            not isinstance(display_name, str) or not display_name.strip()
+        ):
+            raise ConfigurationError(
+                "openclaw.expected_agents.display_name must be a non-empty string"
+            )
+
+        role = agent.get("role")
+        if role is not None:
+            if not isinstance(role, str) or not _AGENT_ROLE.fullmatch(role):
+                raise ConfigurationError("openclaw.expected_agents.role must be an uppercase role")
+            role = role.upper()
+
+        agents.append(
+            ExpectedAgentConfig(
+                id=agent_id,
+                display_name=display_name.strip() if isinstance(display_name, str) else None,
+                role=role,
+            )
+        )
+    return tuple(agents)
 
 
 def load_app_config(path: str | Path) -> AppConfig:
@@ -150,8 +192,12 @@ def load_app_config(path: str | Path) -> AppConfig:
         not isinstance(manager_agent_id, str) or not _AGENT_ID.fullmatch(manager_agent_id)
     ):
         raise ConfigurationError("openclaw.manager_agent_id must be a valid agent id")
+    expected_raw = openclaw_map.get("expected_agents", raw.get("expected_agents"))
     openclaw = OpenClawConfig(
-        str(access_method), tuple(legacy_raw), manager_agent_id
+        str(access_method),
+        tuple(legacy_raw),
+        manager_agent_id,
+        _expected_agents(expected_raw),
     )
 
     return AppConfig(

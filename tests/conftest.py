@@ -43,7 +43,7 @@ def sample_project(tmp_path: Path) -> ProjectRecord:
     return ProjectRecord(
         id="sample-paper",
         name="Sample Paper",
-        type="paper",
+        type="article",
         lifecycle="active",
         phase="WRITING",
         agent_id="sample-lead",

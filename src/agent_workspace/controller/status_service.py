@@ -11,6 +11,7 @@ from ..config import load_app_config
 from ..models import (
     AppConfig,
     BoundedCommandRunner,
+    ExpectedAgentConfig,
     ProjectRecord,
     ProjectRegistry,
     SourceObservation,
@@ -26,6 +27,14 @@ from .registry import RegistryReader
 
 def _data(observation: SourceObservation) -> dict[str, Any]:
     return dict(observation.data) if observation.data is not None else {}
+
+
+class AgentRoster(list[dict[str, Any]]):
+    """List-compatible agent payload with source metadata for web routes."""
+
+    def __init__(self, items: Iterable[dict[str, Any]], meta: Mapping[str, Any]) -> None:
+        super().__init__(items)
+        self.meta = dict(meta)
 
 
 class StatusService:
@@ -81,6 +90,9 @@ class StatusService:
             for agent in agents
             if isinstance(agent, Mapping) and isinstance(agent.get("id"), str)
         }
+
+    def _expected_agent_index(self) -> dict[str, ExpectedAgentConfig]:
+        return {agent.id: agent for agent in self.config.openclaw.expected_agents}
 
     def _project(
         self,
@@ -229,58 +241,89 @@ class StatusService:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    @staticmethod
+    def _source_meta(observation: SourceObservation) -> dict[str, Any]:
+        message = None
+        if observation.availability != "AVAILABLE":
+            message = observation.error or "Live source unavailable; showing configured agents."
+        return {
+            "availability": observation.availability,
+            "queried_at": observation.queried_at,
+            "observed_at": observation.observed_at,
+            "last_success_at": observation.observed_at if observation.stale else None,
+            "stale": observation.stale,
+            "message": message,
+        }
+
+    def _agent_role(
+        self,
+        *,
+        agent_id: str,
+        expected: ExpectedAgentConfig | None,
+        assigned: list[str],
+        live_agent: Mapping[str, Any] | None,
+    ) -> str:
+        if expected and expected.role:
+            return expected.role
+        if assigned:
+            return "PROJECT_LEAD"
+        if agent_id == self.config.openclaw.manager_agent_id:
+            return "MANAGER"
+        is_default = bool(live_agent.get("is_default")) if live_agent else False
+        if is_default or agent_id in self.config.openclaw.legacy_agents:
+            return "LEGACY"
+        return "UNREGISTERED"
+
     def agents(self) -> list[dict[str, Any]]:
         registry = self._registry()
         observation, sessions = self._openclaw_live_pair()
         source_agents = self._agent_index(observation)
+        expected_agents = self._expected_agent_index()
         projects_by_agent: dict[str, list[str]] = {}
         for project in registry.projects:
             projects_by_agent.setdefault(project.agent_id, []).append(project.id)
 
         results: list[dict[str, Any]] = []
-        for agent_id, agent in sorted(source_agents.items()):
+        agent_ids = set(source_agents) | set(expected_agents) | set(projects_by_agent)
+        for agent_id in sorted(agent_ids):
+            agent = source_agents.get(agent_id)
+            expected = expected_agents.get(agent_id)
             session = self.openclaw_reader.session_for_agent(agent_id, sessions)
             session_data = _data(session)
-            is_default = bool(agent.get("is_default"))
-            explicitly_legacy = agent_id in self.config.openclaw.legacy_agents
+            is_default = bool(agent.get("is_default")) if agent else False
             assigned = projects_by_agent.get(agent_id, [])
-            role = "PROJECT_LEAD" if assigned else "UNREGISTERED"
-            if agent_id == self.config.openclaw.manager_agent_id:
-                role = "MANAGER"
-            elif not assigned and (is_default or explicitly_legacy):
-                role = "LEGACY"
+            role = self._agent_role(
+                agent_id=agent_id,
+                expected=expected,
+                assigned=assigned,
+                live_agent=agent,
+            )
+            name = None
+            model = None
+            if agent:
+                name = agent.get("name")
+                model = agent.get("model")
+            if expected and expected.display_name:
+                name = expected.display_name
+            exists = True if agent else (False if observation.data is not None else None)
             results.append(
                 {
                     "id": agent_id,
-                    "name": agent.get("name"),
-                    "model": agent.get("model"),
-                    "exists": True,
+                    "name": name,
+                    "model": model,
+                    "exists": exists,
                     "is_default": is_default,
                     "role": role,
                     "projects": assigned,
                     "recent_session_at": session_data.get("recent_session_at"),
                     "availability": observation.availability,
+                    "live_confirmed": observation.availability == "AVAILABLE" and agent is not None,
+                    "stale": observation.stale,
+                    "expected": expected is not None,
                     "session_source": session.as_dict(),
                 }
             )
-
-        for agent_id, project_ids in sorted(projects_by_agent.items()):
-            if agent_id not in source_agents:
-                results.append(
-                    {
-                        "id": agent_id,
-                        "name": None,
-                        "model": None,
-                        "exists": False if observation.data is not None else None,
-                        "is_default": False,
-                        "role": "PROJECT_LEAD",
-                        "projects": project_ids,
-                        "recent_session_at": None,
-                        "availability": observation.availability,
-                        "session_source": None,
-                    }
-                )
-        return results
+        return AgentRoster(results, self._source_meta(observation))
 
     def activity(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []

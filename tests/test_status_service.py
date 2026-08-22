@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 from threading import Lock
 
+import pytest
+
+from agent_workspace.config import load_app_config
 from agent_workspace.controller.github_reader import GitHubReader
 from agent_workspace.controller.openclaw_reader import OpenClawReader
 from agent_workspace.controller.status_service import StatusService
@@ -12,6 +15,8 @@ from agent_workspace.models import (
     AppConfig,
     CommandConfig,
     CommandResult,
+    ConfigurationError,
+    ExpectedAgentConfig,
     OpenClawConfig,
     ProjectRegistry,
     RuntimeConfig,
@@ -105,7 +110,11 @@ class MethodRunner:
         return self.by_method[method]
 
 
-def _config(tmp_path: Path) -> AppConfig:
+def _config(
+    tmp_path: Path,
+    *,
+    expected_agents: tuple[ExpectedAgentConfig, ...] = (),
+) -> AppConfig:
     return AppConfig(
         version=1,
         mode="read_only",
@@ -118,10 +127,113 @@ def _config(tmp_path: Path) -> AppConfig:
         commands=CommandConfig(Path("/usr/bin/git"), Path("/usr/bin/gh"), Path("/bin/true")),
         cache_ttl_seconds=0,
         openclaw=OpenClawConfig(
-            "local_gateway_rpc", ("legacy-default",), "workspace-manager"
+            "local_gateway_rpc", ("legacy-default",), "workspace-manager", expected_agents
         ),
         source_path=tmp_path / "agent-ops.yaml",
     )
+
+
+def _config_yaml(tmp_path: Path, expected_yaml: str) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    project_registry = tmp_path / "projects.yaml"
+    project_registry.write_text("version: 1\nprojects: []\n", encoding="utf-8")
+    knowledge = tmp_path / "knowledge"
+    knowledge.mkdir()
+    runtime = tmp_path / "runtime.db"
+    config = tmp_path / "agent-ops.yaml"
+    config.write_text(
+        f"""
+version: 1
+mode: read_only
+listen_host: 127.0.0.1
+listen_port: 3001
+project_registry: {project_registry}
+knowledge_root: {knowledge}
+public_blueprint_path: {tmp_path}
+runtime_sqlite_cache: {runtime}
+commands:
+  git: /bin/true
+  gh: /bin/true
+  openclaw: /bin/true
+openclaw:
+  access_method: local_gateway_rpc
+{expected_yaml}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_expected_agents_yaml_parsing_and_role_validation(tmp_path: Path) -> None:
+    config = load_app_config(
+        _config_yaml(
+            tmp_path,
+            """
+  expected_agents:
+    - id: sample-lead
+      display_name: Sample Lead
+      role: PROJECT_LEAD
+    - id: workspace-builder
+      display_name: Workspace Builder
+      role: BUILDER
+""",
+        )
+    )
+
+    assert [agent.id for agent in config.openclaw.expected_agents] == [
+        "sample-lead",
+        "workspace-builder",
+    ]
+    assert [agent.role for agent in config.openclaw.expected_agents] == [
+        "PROJECT_LEAD",
+        "BUILDER",
+    ]
+    assert config.openclaw.expected_agents[0].display_name == "Sample Lead"
+
+
+def test_expected_agents_reject_duplicate_ids_and_invalid_roles(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="duplicate"):
+        load_app_config(
+            _config_yaml(
+                tmp_path,
+                """
+  expected_agents:
+    - id: sample-lead
+      role: PROJECT_LEAD
+    - id: sample-lead
+      role: BUILDER
+""",
+            )
+        )
+
+    with pytest.raises(ConfigurationError, match="uppercase role"):
+        load_app_config(
+            _config_yaml(
+                tmp_path / "invalid-role",
+                """
+  expected_agents:
+    - id: sample-lead
+      role: project lead
+""",
+            )
+        )
+
+
+def test_public_fixtures_do_not_contain_deployment_agent_ids() -> None:
+    fixture_root = Path(__file__).parent / "fixtures"
+    forbidden = {
+        "".join(("m", "a", "i", "n")),
+        "".join(("m", "a", "n", "a", "g", "e", "r")),
+        "".join(("o", "p", "s", "-", "b", "u", "i", "l", "d", "e", "r")),
+        "".join(("p", "a", "p", "e", "r")),
+    }
+    for path in fixture_root.rglob("*"):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for agent_id in forbidden:
+            assert f'"{agent_id}"' not in text
+            assert f"'{agent_id}'" not in text
 
 
 def test_status_service_uses_phase_when_total_tasks_zero(tmp_path, sample_project) -> None:
@@ -265,11 +377,11 @@ def test_openclaw_failure_falls_back_and_session_keys_never_escape() -> None:
 
 def test_status_service_fetches_all_sessions_once_for_four_agents(tmp_path, sample_project) -> None:
     agents_payload = {
-        "defaultId": "main",
+        "defaultId": "legacy-default",
         "agents": [
-            {"id": "main", "name": "Main"},
-            {"id": "manager", "name": "Manager"},
-            {"id": "ops-builder", "name": "Ops Builder"},
+            {"id": "legacy-default", "name": "Legacy Default"},
+            {"id": "workspace-manager", "name": "Workspace Manager"},
+            {"id": "workspace-builder", "name": "Workspace Builder"},
             {"id": "sample-lead", "name": "Sample Lead"},
         ],
     }
@@ -277,8 +389,8 @@ def test_status_service_fetches_all_sessions_once_for_four_agents(tmp_path, samp
         "sessions": [
             {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_000_000},
             {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_100_000},
-            {"agentRuntime": {"id": "manager"}, "updatedAt": 1_893_456_050_000},
-            {"agentRuntime": {"id": "ops-builder"}, "updatedAt": 1_893_456_025_000},
+            {"agentRuntime": {"id": "workspace-manager"}, "updatedAt": 1_893_456_050_000},
+            {"agentRuntime": {"id": "workspace-builder"}, "updatedAt": 1_893_456_025_000},
         ]
     }
     runner = MethodRunner(
@@ -297,9 +409,9 @@ def test_status_service_fetches_all_sessions_once_for_four_agents(tmp_path, samp
     agents = service.agents()
 
     assert {agent["id"] for agent in agents} == {
-        "main",
-        "manager",
-        "ops-builder",
+        "legacy-default",
+        "workspace-manager",
+        "workspace-builder",
         "sample-lead",
     }
     assert next(agent for agent in agents if agent["id"] == "sample-lead")[
@@ -314,12 +426,12 @@ def test_status_service_fetches_all_sessions_once_for_four_agents(tmp_path, samp
 def test_openclaw_groups_all_sessions_by_recent_agent_activity() -> None:
     payload = {
         "sessions": [
-            {"agentRuntime": {"id": "paper"}, "updatedAt": 1_893_456_000_000},
-            {"agentRuntime": {"id": "paper"}, "lastActivityAt": 1_893_456_500_000},
-            {"agentRuntime": {"id": "manager"}, "updatedAt": 1_893_456_100_000},
+            {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_000_000},
+            {"agentRuntime": {"id": "sample-lead"}, "lastActivityAt": 1_893_456_500_000},
+            {"agentRuntime": {"id": "workspace-manager"}, "updatedAt": 1_893_456_100_000},
             {
-                "agentRuntime": {"id": "paper"},
-                "key": ":".join(("agent", "paper", "dashboard", "must-not-escape")),
+                "agentRuntime": {"id": "sample-lead"},
+                "key": ":".join(("agent", "sample-lead", "dashboard", "must-not-escape")),
                 "updatedAt": 1_893_456_250_000,
             },
         ]
@@ -328,12 +440,12 @@ def test_openclaw_groups_all_sessions_by_recent_agent_activity() -> None:
     reader = OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0)
 
     sessions = reader.list_agent_sessions()
-    paper = reader.session_for_agent("paper", sessions)
-    manager = reader.session_for_agent("manager", sessions)
+    sample = reader.session_for_agent("sample-lead", sessions)
+    manager = reader.session_for_agent("workspace-manager", sessions)
     serialized = json.dumps(sessions.as_dict())
 
-    assert paper.data == {
-        "agent_id": "paper",
+    assert sample.data == {
+        "agent_id": "sample-lead",
         "recent_session_at": "2030-01-01T00:08:20Z",
         "session_count": 3,
     }
@@ -357,20 +469,137 @@ def test_agents_list_timeout_returns_registered_agents_without_live_source(tmp_p
 
     agents = service.agents()
 
-    assert agents == [
+    assert agents.meta["availability"] == "UNAVAILABLE"
+    assert [agent["id"] for agent in agents] == ["sample-lead"]
+    assert agents[0]["exists"] is None
+    assert agents[0]["role"] == "PROJECT_LEAD"
+    assert agents[0]["projects"] == ["sample-paper"]
+    assert agents[0]["recent_session_at"] is None
+    assert agents[0]["live_confirmed"] is False
+    assert agents[0]["session_source"]["availability"] == "UNAVAILABLE"
+
+
+def test_live_agents_and_expected_roster_are_unioned(tmp_path, sample_project) -> None:
+    expected = (
+        ExpectedAgentConfig("sample-lead", "Configured Lead", "PROJECT_LEAD"),
+        ExpectedAgentConfig("workspace-builder", "Workspace Builder", "BUILDER"),
+    )
+    runner = MethodRunner(
         {
-            "id": "sample-lead",
-            "name": None,
-            "model": None,
-            "exists": None,
-            "is_default": False,
-            "role": "PROJECT_LEAD",
-            "projects": ["sample-paper"],
-            "recent_session_at": None,
-            "availability": "UNAVAILABLE",
-            "session_source": None,
+            "agents.list": CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "agents": [
+                            {"id": "sample-lead", "name": "Runtime Lead"},
+                            {"id": "runtime-extra", "name": "Runtime Extra"},
+                        ]
+                    }
+                ),
+                "",
+            ),
+            "sessions.list": CommandResult(0, json.dumps({"sessions": []}), ""),
         }
+    )
+    service = StatusService(
+        _config(tmp_path, expected_agents=expected),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0),
+    )
+
+    agents = service.agents()
+
+    assert agents.meta["availability"] == "AVAILABLE"
+    assert [agent["id"] for agent in agents] == [
+        "runtime-extra",
+        "sample-lead",
+        "workspace-builder",
     ]
+    assert len({agent["id"] for agent in agents}) == len(agents)
+    sample = next(agent for agent in agents if agent["id"] == "sample-lead")
+    assert sample["name"] == "Configured Lead"
+    assert sample["role"] == "PROJECT_LEAD"
+    assert sample["live_confirmed"] is True
+    builder = next(agent for agent in agents if agent["id"] == "workspace-builder")
+    assert builder["role"] == "BUILDER"
+    assert builder["exists"] is False
+    assert next(agent for agent in agents if agent["id"] == "runtime-extra")["role"] == "UNREGISTERED"
+
+
+def test_live_timeout_preserves_expected_and_project_roster(tmp_path, sample_project) -> None:
+    expected = (
+        ExpectedAgentConfig("legacy-default", "Legacy Default", "LEGACY"),
+        ExpectedAgentConfig("workspace-manager", "Workspace Manager", "MANAGER"),
+        ExpectedAgentConfig("sample-lead", "Configured Lead", "PROJECT_LEAD"),
+        ExpectedAgentConfig("workspace-builder", "Workspace Builder", "BUILDER"),
+    )
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(1, "", "", timed_out=True),
+            "sessions.list": CommandResult(1, "", "", timed_out=True),
+        }
+    )
+    service = StatusService(
+        _config(tmp_path, expected_agents=expected),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0),
+    )
+
+    agents = service.agents()
+    by_id = {agent["id"]: agent for agent in agents}
+
+    assert agents.meta["availability"] == "UNAVAILABLE"
+    assert agents.meta["stale"] is False
+    assert agents.meta["message"]
+    assert list(by_id) == [
+        "legacy-default",
+        "sample-lead",
+        "workspace-builder",
+        "workspace-manager",
+    ]
+    assert len(by_id) == len(agents)
+    assert {agent["role"] for agent in agents} == {
+        "LEGACY",
+        "MANAGER",
+        "PROJECT_LEAD",
+        "BUILDER",
+    }
+    assert all(agent["exists"] is None for agent in agents)
+    assert all(agent["live_confirmed"] is False for agent in agents)
+    assert all(agent["recent_session_at"] is None for agent in agents)
+    assert all(agent["session_source"]["availability"] == "UNAVAILABLE" for agent in agents)
+
+
+def test_agent_roster_stale_cache_sets_meta_last_success_at(tmp_path, sample_project) -> None:
+    runner = MethodRunner(
+        {
+            "agents.list": CommandResult(
+                0,
+                json.dumps({"agents": [{"id": "sample-lead", "name": "Sample Lead"}]}),
+                "",
+            ),
+            "sessions.list": CommandResult(0, json.dumps({"sessions": []}), ""),
+        }
+    )
+    reader = OpenClawReader(Path("/bin/true"), runner, cache_ttl_seconds=0)
+    service = StatusService(
+        _config(tmp_path),
+        registry_reader=StubRegistry(sample_project),
+        openclaw_reader=reader,
+    )
+    first = service.agents()
+
+    runner.by_method = {
+        "agents.list": CommandResult(1, "", "gateway unavailable"),
+        "sessions.list": CommandResult(1, "", "gateway unavailable"),
+    }
+    second = service.agents()
+
+    assert first.meta["availability"] == "AVAILABLE"
+    assert second.meta["availability"] == "UNAVAILABLE"
+    assert second.meta["stale"] is True
+    assert second.meta["last_success_at"] == first.meta["observed_at"]
+    assert [agent["id"] for agent in second] == ["sample-lead"]
 
 
 def test_sessions_timeout_keeps_agent_list_and_marks_sessions_unavailable(tmp_path, sample_project) -> None:
@@ -403,7 +632,11 @@ def test_openclaw_last_success_cache_exposes_stale_timestamp() -> None:
             CommandResult(
                 0,
                 json.dumps(
-                    {"sessions": [{"agentRuntime": {"id": "paper"}, "updatedAt": 1_893_456_000_000}]}
+                    {
+                        "sessions": [
+                            {"agentRuntime": {"id": "sample-lead"}, "updatedAt": 1_893_456_000_000}
+                        ]
+                    }
                 ),
                 "",
             ),

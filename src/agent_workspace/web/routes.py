@@ -57,9 +57,10 @@ class _Observation:
     observed_at: str | None
     stale: bool = False
     message: str | None = None
+    service_meta: Mapping[str, Any] | None = None
 
     def meta(self) -> dict[str, Any]:
-        return {
+        meta = {
             "availability": self.availability,
             "queried_at": self.queried_at,
             "observed_at": self.observed_at,
@@ -67,6 +68,18 @@ class _Observation:
             "stale": self.stale,
             "message": self.message,
         }
+        if self.service_meta:
+            for key in (
+                "availability",
+                "queried_at",
+                "observed_at",
+                "last_success_at",
+                "stale",
+                "message",
+            ):
+                if key in self.service_meta:
+                    meta[key] = self.service_meta[key]
+        return meta
 
 
 class SourceCache:
@@ -149,6 +162,14 @@ def _public_value(value: Any, *, key: str | None = None) -> Any:
         return "UNAVAILABLE"
 
 
+def _service_meta(value: Any) -> Mapping[str, Any] | None:
+    meta = getattr(value, "meta", None)
+    if not isinstance(meta, Mapping):
+        return None
+    public = _public_value(meta)
+    return public if isinstance(public, Mapping) else None
+
+
 async def _invoke(method: Callable[..., Any], *args: Any) -> Any:
     if inspect.iscoroutinefunction(method):
         return await method(*args)
@@ -174,14 +195,17 @@ async def _observe(
         try:
             source_timeout = getattr(request.app.state, "source_timeout_seconds", 8.0)
             invocation = _invoke(method, *args)
-            value = _public_value(
+            raw_value = (
                 await asyncio.wait_for(invocation, timeout=source_timeout)
                 if source_timeout
                 else await invocation
             )
+            service_meta = _service_meta(raw_value)
+            value = _public_value(raw_value)
             observed_at = _utc_now()
-            await cache.put(key, value, observed_at)
-            return _Observation(value, "AVAILABLE", queried_at, observed_at)
+            if not service_meta or service_meta.get("availability") == "AVAILABLE":
+                await cache.put(key, value, observed_at)
+            return _Observation(value, "AVAILABLE", queried_at, observed_at, service_meta=service_meta)
         except (TimeoutError, asyncio.TimeoutError, Exception):
             # Raw provider/command errors must not be reflected into logs or HTML.
             pass
@@ -386,7 +410,7 @@ def _project_view(value: Any, *, queried_at: str | None = None) -> dict[str, Any
 
 def _agent_view(value: Any) -> dict[str, Any]:
     agent = _mapping(value)
-    return {
+    view = {
         "id": _first(agent.get("id"), agent.get("agent_id"), default="unknown"),
         "name": _first(agent.get("name"), agent.get("id"), agent.get("agent_id"), default="Unknown agent"),
         "exists": _first(agent.get("exists"), agent.get("available")),
@@ -396,6 +420,10 @@ def _agent_view(value: Any) -> dict[str, Any]:
         "last_activity_at": _first(agent.get("last_activity_at"), agent.get("recent_session_at")),
         "role": agent.get("role"),
     }
+    for key in ("availability", "live_confirmed", "stale", "expected"):
+        if key in agent:
+            view[key] = agent[key]
+    return view
 
 
 def _activity_view(value: Any) -> dict[str, Any]:

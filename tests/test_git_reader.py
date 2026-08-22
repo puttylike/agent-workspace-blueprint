@@ -25,7 +25,7 @@ def _git(repo: Path, *args: str) -> None:
 def test_git_reader_reports_branch_head_and_clean_state(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-b", "main")
+    _git(repo, "init", "-b", "primary")
     _git(repo, "config", "user.name", "Fixture Author")
     _git(repo, "config", "user.email", "fixture@example.invalid")
     (repo / "README.md").write_text("fixture\n", encoding="utf-8")
@@ -37,7 +37,7 @@ def test_git_reader_reports_branch_head_and_clean_state(tmp_path: Path) -> None:
     clean = reader.read_workspace(repo)
     assert clean.availability == "AVAILABLE"
     assert clean.data is not None
-    assert clean.data["branch"] == "main"
+    assert clean.data["branch"] == "primary"
     assert clean.data["clean"] is True
     assert len(str(clean.data["head"])) == 40
 
