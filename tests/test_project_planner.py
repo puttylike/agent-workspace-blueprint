@@ -419,6 +419,7 @@ def test_configured_runner_is_validated_but_not_disclosed(
 
     assert result["venture"]["local_runner"]["configured"] is True
     assert str(private_runner) not in encoded
+    assert not any("before entering LOCAL_PARITY" in item for item in result["warnings"])
 
     for extra_args in ([], ["--json"]):
         code = main(

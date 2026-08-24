@@ -224,7 +224,6 @@ def _warnings(project_type: str, visibility: str) -> list[str]:
     if project_type == "venture":
         warnings.extend(
             (
-                "Configure the local runner before entering LOCAL_PARITY.",
                 "affiliate_first is a default priority, not a success claim or an exclusive monetization model.",
                 "Do not infer actual revenue, conversion rate, success rate, or progress without observed evidence.",
                 "Live trading is prohibited for venture projects.",
@@ -430,6 +429,8 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
     if venture is not None:
         result["phase"] = venture["lifecycle"]["initial_phase"]
         result["venture"] = venture
+        if not venture["local_runner"]["configured"]:
+            result["warnings"].append("Configure the local runner before entering LOCAL_PARITY.")
         result["approvals_required"] = _approvals(project_type, visibility) + _venture_approvals(
             config.venture_defaults
         )
