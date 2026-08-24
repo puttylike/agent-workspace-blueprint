@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import socket
 import subprocess
@@ -12,6 +13,7 @@ from agent_workspace.cli import main
 from agent_workspace.controller.project_apply import (
     ACTION_ORDER,
     APPLY_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
     ApplyContractError,
     CollisionObservation,
     IdempotencyDecision,
@@ -30,6 +32,7 @@ from agent_workspace.controller.project_apply import (
 
 def approved_plan(tmp_path: Path) -> dict:
     workspace_root = tmp_path / "projects"
+    workspace_root.mkdir(exist_ok=True)
     return {
         "schema_version": APPLY_SCHEMA_VERSION,
         "project_id": "sample-venture",
@@ -174,13 +177,51 @@ def test_path_traversal_and_root_escape_are_rejected(tmp_path: Path, workspace: 
 def test_symlink_collision_is_rejected(tmp_path: Path) -> None:
     plan = approved_plan(tmp_path)
     root = Path(plan["workspace_root"])
-    root.mkdir()
     target = tmp_path / "target"
     target.mkdir()
     Path(plan["proposed_workspace"]).symlink_to(target, target_is_directory=True)
 
     with pytest.raises(ApplyContractError, match="symlink"):
         validate_plan(plan)
+
+
+def test_workspace_root_must_exist_and_be_a_directory(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    Path(plan["workspace_root"]).rmdir()
+    with pytest.raises(ApplyContractError, match="existing directory"):
+        validate_plan(plan)
+
+
+def test_workspace_root_symlink_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    root = Path(plan["workspace_root"])
+    root.rmdir()
+    target = tmp_path / "real-projects"
+    target.mkdir()
+    root.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ApplyContractError, match="symlink"):
+        validate_plan(plan)
+
+
+def test_intermediate_ancestor_symlink_and_escape_are_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    root = Path(plan["workspace_root"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    intermediate = root / "nested"
+    intermediate.symlink_to(outside, target_is_directory=True)
+    plan["proposed_workspace"] = str(intermediate / plan["project_id"])
+    with pytest.raises(ApplyContractError, match="symlink"):
+        validate_plan(plan)
+
+
+def test_nonexistent_workspace_with_safe_ancestors_is_allowed(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    nested = Path(plan["workspace_root"]) / "safe"
+    nested.mkdir()
+    plan["proposed_workspace"] = str(nested / plan["project_id"])
+    assert not Path(plan["proposed_workspace"]).exists()
+    validate_plan(plan)
 
 
 def test_discover_allows_unconfigured_runner_and_warns_for_local_parity(tmp_path: Path) -> None:
@@ -213,11 +254,23 @@ def test_forbidden_metric_keys_are_rejected(tmp_path: Path, metric: str) -> None
         validate_plan(plan)
 
 
-def test_action_manifest_is_ordered_and_contains_inputs_only(tmp_path: Path) -> None:
+def test_action_manifest_is_deterministic_identity_bound_and_private_safe(tmp_path: Path) -> None:
     manifest = action_manifest(approved_plan(tmp_path))
-    assert [item["action"] for item in manifest] == list(ACTION_ORDER)
-    assert all(set(item) == {"order", "action", "required_inputs"} for item in manifest)
+    assert canonical_json_bytes(manifest) == canonical_json_bytes(action_manifest(approved_plan(tmp_path)))
+    assert manifest["manifest_schema_version"] == MANIFEST_SCHEMA_VERSION
+    assert [item["action"] for item in manifest["ordered_actions"]] == list(ACTION_ORDER)
+    assert all(set(item) == {"order", "action", "required_inputs"} for item in manifest["ordered_actions"])
+    identity = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    assert manifest["manifest_sha256"] == hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
     assert str(tmp_path) not in json.dumps(manifest)
+
+
+def test_any_plan_change_changes_manifest_identity(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    changed = copy.deepcopy(plan)
+    changed["display_name"] = "Changed"
+    assert action_manifest(plan)["manifest_sha256"] != action_manifest(changed)["manifest_sha256"]
+    assert action_manifest(plan)["plan_sha256"] != action_manifest(changed)["plan_sha256"]
 
 
 @pytest.mark.parametrize(
@@ -274,6 +327,6 @@ def test_public_cli_is_validation_only_and_filesystem_invariant(
 
     assert code == 0
     assert output["execution_performed"] is False
-    assert [item["action"] for item in output["action_manifest"]] == list(ACTION_ORDER)
+    assert [item["action"] for item in output["action_manifest"]["ordered_actions"]] == list(ACTION_ORDER)
     assert calls == []
     assert after == before

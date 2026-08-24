@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 APPLY_SCHEMA_VERSION = "agent-workspace-project-apply/v1"
+MANIFEST_SCHEMA_VERSION = "agent-workspace-action-manifest/v1"
 APPROVAL_GATES = (
     "external_publishing",
     "account_creation",
@@ -206,16 +207,46 @@ def _validate_workspace(plan: Mapping[str, Any]) -> None:
     workspace_normal = Path(os.path.abspath(workspace))
     if root != root_normal or workspace != workspace_normal:
         raise ApplyContractError("workspace paths must be lexically normalized")
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise ApplyContractError("workspace root must be an existing directory") from exc
+    if root_stat.st_mode & 0o170000 == 0o120000:
+        raise ApplyContractError("workspace root cannot be a symlink")
+    if not root.is_dir():
+        raise ApplyContractError("workspace root must be an existing directory")
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ApplyContractError("workspace root must be an existing directory") from exc
     project_id = str(plan.get("project_id", ""))
-    if workspace.parent != root or workspace.name != project_id:
-        raise ApplyContractError("workspace must be the project-id child of workspace_root")
+    if workspace.name != project_id:
+        raise ApplyContractError("workspace name must match project_id")
     try:
         if os.path.commonpath((str(root), str(workspace))) != str(root):
             raise ApplyContractError("workspace escapes workspace_root")
     except ValueError as exc:
         raise ApplyContractError("workspace escapes workspace_root") from exc
-    if workspace.is_symlink():
-        raise ApplyContractError("workspace collides with a symlink")
+    relative = workspace.relative_to(root)
+    current = root
+    deepest_existing = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ApplyContractError("workspace path cannot be inspected safely") from exc
+        if current_stat.st_mode & 0o170000 == 0o120000:
+            raise ApplyContractError("workspace path cannot contain a symlink")
+        deepest_existing = current
+    try:
+        resolved_ancestor = deepest_existing.resolve(strict=True)
+        if os.path.commonpath((str(resolved_root), str(resolved_ancestor))) != str(resolved_root):
+            raise ApplyContractError("workspace escapes workspace root")
+    except ValueError as exc:
+        raise ApplyContractError("workspace escapes workspace root") from exc
 
 
 def validate_plan(plan: Mapping[str, Any]) -> tuple[str, ...]:
@@ -299,12 +330,26 @@ def validate_plan(plan: Mapping[str, Any]) -> tuple[str, ...]:
     return ("Configure the local runner before entering LOCAL_PARITY.",)
 
 
-def action_manifest(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+def action_manifest(plan: Mapping[str, Any]) -> dict[str, Any]:
     validate_plan(plan)
-    return [
-        {"order": index, "action": action, "required_inputs": list(_ACTION_INPUTS[action])}
-        for index, action in enumerate(ACTION_ORDER, start=1)
-    ]
+    profile_policy = _require_mapping(plan.get("profile_policy"), "profile_policy")
+    identity: dict[str, Any] = {
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "plan_schema_version": plan["schema_version"],
+        "plan_sha256": plan_sha256(plan),
+        "project_id": plan["project_id"],
+        "project_type": plan["type"],
+        "visibility": plan["visibility"],
+        "profile_policy_sha256": hashlib.sha256(canonical_json_bytes(profile_policy)).hexdigest(),
+        "ordered_actions": [
+            {"order": index, "action": action, "required_inputs": list(_ACTION_INPUTS[action])}
+            for index, action in enumerate(ACTION_ORDER, start=1)
+        ],
+    }
+    return {
+        **identity,
+        "manifest_sha256": hashlib.sha256(canonical_json_bytes(identity)).hexdigest(),
+    }
 
 
 def classify_preflight(value: PreflightInput) -> PreflightResult:
