@@ -22,6 +22,7 @@ from agent_workspace.controller.project_apply import (
     action_manifest,
     canonical_json_bytes,
     classify_preflight,
+    classify_required_preflight,
     parse_plan_file,
     plan_sha256,
     redact_private_values,
@@ -293,6 +294,18 @@ def test_policy_or_digest_failure_is_blocked() -> None:
     assert classify_preflight(PreflightInput(observations, digest_valid=False)).decision == IdempotencyDecision.BLOCKED
 
 
+def test_production_preflight_requires_exact_target_set() -> None:
+    required = ("workspace", "repository", "profile")
+    incomplete = tuple(CollisionObservation(target, TargetState.ABSENT) for target in required[:-1])
+    complete = tuple(CollisionObservation(target, TargetState.ABSENT) for target in required)
+    duplicate = complete[:-1] + (complete[0],)
+
+    assert classify_preflight(PreflightInput(incomplete)).decision == IdempotencyDecision.READY_TO_APPLY
+    assert classify_required_preflight(PreflightInput(incomplete), required).decision == IdempotencyDecision.BLOCKED
+    assert classify_required_preflight(PreflightInput(duplicate), required).decision == IdempotencyDecision.BLOCKED
+    assert classify_required_preflight(PreflightInput(complete), required).decision == IdempotencyDecision.READY_TO_APPLY
+
+
 def test_private_values_are_redacted() -> None:
     value = {"workspace": "/private/path", "nested": {"oauth_token": "secret-value"}, "safe": "ok"}
     redacted = redact_private_values(value)
@@ -330,3 +343,29 @@ def test_public_cli_is_validation_only_and_filesystem_invariant(
     assert [item["action"] for item in output["action_manifest"]["ordered_actions"]] == list(ACTION_ORDER)
     assert calls == []
     assert after == before
+
+
+def test_public_cli_non_json_prints_identity_digests_and_ordered_actions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = approved_plan(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    write_canonical(plan_path, plan)
+
+    code = main(["projects", "apply", "--plan-file", str(plan_path), "--approval-sha256", plan_sha256(plan)])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Validation: VALID" in output
+    assert "Project: sample-venture" in output
+    assert f"Plan SHA-256: {plan_sha256(plan)}" in output
+    assert f"Manifest SHA-256: {action_manifest(plan)['manifest_sha256']}" in output
+    assert "Actions: " + ", ".join(ACTION_ORDER) in output
+
+
+def test_public_cli_invalid_plan_remains_nonzero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "bad.json"
+    path.write_bytes(b"{")
+    assert main(["projects", "apply", "--plan-file", str(path), "--approval-sha256", "0" * 64]) != 0
+    assert "invalid_project_apply" in capsys.readouterr().out

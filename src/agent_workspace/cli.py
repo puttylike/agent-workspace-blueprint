@@ -135,10 +135,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.json:
             _json(result)
         else:
-            print(f"Plan: {result['status']}")
+            manifest = result["action_manifest"]
+            print(f"Validation: {result['status']}")
             print(f"Schema: {result['schema_version']}")
-            print(f"SHA-256: {result['plan_sha256']}")
-            print("Actions: " + ", ".join(item["action"] for item in result["action_manifest"]))
+            print(f"Project: {manifest['project_id']}")
+            print(f"Plan SHA-256: {result['plan_sha256']}")
+            print(f"Manifest SHA-256: {manifest['manifest_sha256']}")
+            print("Actions: " + ", ".join(item["action"] for item in manifest["ordered_actions"]))
             print("Execution performed: false")
         return 0
     try:

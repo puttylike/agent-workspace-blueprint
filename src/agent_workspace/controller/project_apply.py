@@ -353,6 +353,12 @@ def action_manifest(plan: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def classify_preflight(value: PreflightInput) -> PreflightResult:
+    """Classify an already-scoped observation set.
+
+    This generic primitive does not know which targets a production caller must
+    observe. Production callers must use :func:`classify_required_preflight` so
+    an incomplete target set cannot be classified as ready.
+    """
     if not value.policy_valid or not value.digest_valid:
         return PreflightResult(IdempotencyDecision.BLOCKED, ("policy or digest mismatch",))
     if not value.observations:
@@ -366,6 +372,27 @@ def classify_preflight(value: PreflightInput) -> PreflightResult:
     if states == {TargetState.MATCH}:
         return PreflightResult(IdempotencyDecision.ALREADY_APPLIED, ())
     return PreflightResult(IdempotencyDecision.PARTIAL_COLLISION, ("only some targets exist",))
+
+
+def classify_required_preflight(
+    value: PreflightInput,
+    required_targets: Sequence[str],
+) -> PreflightResult:
+    """Fail closed unless observations exactly cover required production targets."""
+
+    required = tuple(required_targets)
+    observed = tuple(item.target for item in value.observations)
+    if (
+        not required
+        or len(required) != len(set(required))
+        or len(observed) != len(set(observed))
+        or set(observed) != set(required)
+    ):
+        return PreflightResult(
+            IdempotencyDecision.BLOCKED,
+            ("required target observations are incomplete, duplicated, or unknown",),
+        )
+    return classify_preflight(value)
 
 
 def redact_private_values(value: Any) -> Any:
