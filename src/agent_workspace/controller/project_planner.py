@@ -208,13 +208,6 @@ def _approvals(project_type: str, visibility: str) -> list[str]:
         approvals.append("Approve any production deployment.")
     if project_type == "contest":
         approvals.append("Approve any external contest submission.")
-    if project_type == "venture":
-        approvals.append("Approve external publishing before any public release.")
-        approvals.append("Approve account creation before signing up for any service.")
-        approvals.append("Approve payment or subscription changes before spending cash.")
-        approvals.append("Approve affiliate applications before applying.")
-        approvals.append("Approve production deployment before release.")
-        approvals.append("Approve personal data collection before collecting user data.")
     return approvals
 
 
@@ -229,83 +222,56 @@ def _warnings(project_type: str, visibility: str) -> list[str]:
     if project_type == "quant":
         warnings.append("Do not connect broker accounts, place orders, or run live trading from this plan.")
     if project_type == "venture":
-        warnings.append("Do not run live trading from a venture plan.")
+        warnings.extend(
+            (
+                "Configure the local runner before entering LOCAL_PARITY.",
+                "affiliate_first is a default priority, not a success claim or an exclusive monetization model.",
+                "Do not infer actual revenue, conversion rate, success rate, or progress without observed evidence.",
+                "Live trading is prohibited for venture projects.",
+            )
+        )
     return warnings
 
 
 _APPROVAL_LABELS = {
-    "external_publish": "external publishing",
+    "external_publishing": "external publishing",
     "account_creation": "account creation",
     "payment": "payment",
     "affiliate_application": "affiliate application",
-    "production_deploy": "production deployment",
-    "personal_data_collection": "personal data collection",
-    "live_trading": "live trading",
+    "production_deployment": "production deployment",
 }
-
-
-def _missing_user_inputs(defaults: VentureDefaultsConfig) -> list[str]:
-    missing: list[str] = []
-    if defaults.local.runner is None:
-        missing.append("local_runner")
-    if defaults.local.model is None:
-        missing.append("local_model")
-    if not defaults.quality_gate.metrics:
-        missing.append("quality_gate.metrics")
-    if defaults.shadow_run_days is None:
-        missing.append("shadow_run_days")
-    if defaults.schedule is None:
-        missing.append("schedule")
-    if not defaults.success_metrics:
-        missing.append("success_metrics")
-    if not defaults.kill_criteria:
-        missing.append("kill_criteria")
-    return missing
 
 
 def _venture_plan(defaults: VentureDefaultsConfig) -> dict[str, Any]:
     return {
-        "strategy": defaults.strategy,
-        "lifecycle_stage": defaults.lifecycle.initial_stage,
-        "lifecycle_stages": list(defaults.lifecycle.stages),
-        "monetization_model": defaults.monetization.preferred,
-        "free_user_access_preferred": defaults.monetization.free_user_access_preferred,
-        "frontier_policy": {
-            "allowed_uses": list(defaults.frontier.allowed_uses),
-            "subscription": defaults.frontier.subscription,
-            "additional_monthly_cash_budget_krw": defaults.frontier.monthly_cash_budget_krw,
+        "monetization": {
+            "default_strategy": defaults.monetization.default_strategy,
         },
-        "local_runner_required": defaults.local.runner_required,
-        "local_runner": defaults.local.runner,
-        "local_model": defaults.local.model,
-        "quality_gate": {
-            "required": defaults.quality_gate.required,
-            "metrics": list(defaults.quality_gate.metrics),
+        "monthly_incremental_budget": {
+            "currency": defaults.monthly_incremental_budget.currency,
+            "amount": defaults.monthly_incremental_budget.amount,
         },
-        "shadow_run_days": defaults.shadow_run_days,
-        "schedule": defaults.schedule,
-        "success_metrics": list(defaults.success_metrics),
-        "kill_criteria": list(defaults.kill_criteria),
-        "platform_risks": list(defaults.risks.platform),
-        "licensing_risks": list(defaults.risks.licensing),
-        "approvals": {
-            "required": list(defaults.approvals.required),
-            "prohibited": list(defaults.approvals.prohibited),
+        "lifecycle": {
+            "stages": list(defaults.lifecycle.stages),
+            "initial_phase": defaults.lifecycle.initial_phase,
+            "current_phase": defaults.lifecycle.initial_phase,
         },
-        "missing_user_inputs": _missing_user_inputs(defaults),
+        "local_runner": {
+            "required": defaults.local_runner.required,
+            "required_by_phase": defaults.local_runner.required_by_phase,
+            "configured": defaults.local_runner.executable is not None,
+        },
+        "approval_gates": list(defaults.approval_gates),
+        "prohibited_actions": list(defaults.prohibited_actions),
+        "evidence_policy": {"actual_metrics": defaults.actual_metrics_policy},
     }
 
 
 def _venture_approvals(defaults: VentureDefaultsConfig) -> list[str]:
-    required = [
+    return [
         f"Approve {_APPROVAL_LABELS.get(item, item.replace('_', ' '))}."
-        for item in defaults.approvals.required
+        for item in defaults.approval_gates
     ]
-    prohibited = [
-        f"{_APPROVAL_LABELS.get(item, item.replace('_', ' ')).title()} is prohibited."
-        for item in defaults.approvals.prohibited
-    ]
-    return required + prohibited
 
 
 def _duplicate_candidates(
@@ -411,8 +377,7 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
     }
     venture = _venture_plan(config.venture_defaults) if project_type == "venture" else None
     if venture is not None:
-        registry_entry["phase"] = venture["lifecycle_stage"]
-        registry_entry["venture"] = venture
+        registry_entry["phase"] = venture["lifecycle"]["initial_phase"]
 
     result = {
         "project_id": slug,
@@ -463,10 +428,8 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
         "executable": False,
     }
     if venture is not None:
-        result["phase"] = venture["lifecycle_stage"]
-        result["proposed_lead"]["specialization"] = "VENTURE"
+        result["phase"] = venture["lifecycle"]["initial_phase"]
         result["venture"] = venture
-        result["missing_user_inputs"] = venture["missing_user_inputs"]
         result["approvals_required"] = _approvals(project_type, visibility) + _venture_approvals(
             config.venture_defaults
         )

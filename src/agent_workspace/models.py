@@ -75,61 +75,36 @@ class OpenClawConfig:
 @dataclass(frozen=True)
 class VentureLifecycleConfig:
     stages: tuple[str, ...]
-    initial_stage: str
+    initial_phase: str
 
 
 @dataclass(frozen=True)
 class VentureMonetizationConfig:
-    preferred: str
-    free_user_access_preferred: bool
+    default_strategy: str
 
 
 @dataclass(frozen=True)
-class VentureFrontierConfig:
-    allowed_uses: tuple[str, ...]
-    subscription: str
-    monthly_cash_budget_krw: int | None
+class VentureBudgetConfig:
+    currency: str
+    amount: int
 
 
 @dataclass(frozen=True)
-class VentureLocalConfig:
-    runner_required: bool
-    runner: str | None = None
-    model: str | None = None
-
-
-@dataclass(frozen=True)
-class VentureQualityGateConfig:
+class VentureLocalRunnerConfig:
     required: bool
-    metrics: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class VentureRiskConfig:
-    platform: tuple[str, ...] = ()
-    licensing: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class VentureApprovalConfig:
-    required: tuple[str, ...] = ()
-    prohibited: tuple[str, ...] = ()
+    required_by_phase: str
+    executable: Path | None = None
 
 
 @dataclass(frozen=True)
 class VentureDefaultsConfig:
-    strategy: str
-    lifecycle: VentureLifecycleConfig
     monetization: VentureMonetizationConfig
-    frontier: VentureFrontierConfig
-    local: VentureLocalConfig
-    quality_gate: VentureQualityGateConfig
-    shadow_run_days: int | None
-    schedule: str | None
-    success_metrics: tuple[str, ...]
-    kill_criteria: tuple[str, ...]
-    risks: VentureRiskConfig
-    approvals: VentureApprovalConfig
+    monthly_incremental_budget: VentureBudgetConfig
+    lifecycle: VentureLifecycleConfig
+    local_runner: VentureLocalRunnerConfig
+    approval_gates: tuple[str, ...]
+    prohibited_actions: tuple[str, ...]
+    actual_metrics_policy: str
 
 
 @dataclass(frozen=True)
