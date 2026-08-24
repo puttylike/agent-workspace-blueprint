@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument(
         "--type",
         required=True,
-        choices=("paper", "blog", "quant", "app", "contest", "misc"),
+        choices=("paper", "blog", "quant", "app", "contest", "misc", "venture"),
         dest="project_type",
         help="project type",
     )

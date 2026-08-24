@@ -15,6 +15,8 @@ designed to remain safe to publish.
 - `awc doctor` validates configuration and local prerequisites.
 - `awc projects list` and `awc projects show <project-id>` aggregate project
   state from read-only sources.
+- `awc projects plan --type venture` emits a plan-only venture lifecycle proposal;
+  it never creates a workspace, repository, Lead, Beads state, or local runner.
 - `awc agents list` reports declared agent presence and recent activity.
 - `awc wiki index` builds a local SQLite FTS5 search cache for Markdown.
 - `awc serve --host 127.0.0.1 --port 3001` serves the read-only Agent Ops UI.

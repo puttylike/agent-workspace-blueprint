@@ -73,6 +73,41 @@ class OpenClawConfig:
 
 
 @dataclass(frozen=True)
+class VentureLifecycleConfig:
+    stages: tuple[str, ...]
+    initial_phase: str
+
+
+@dataclass(frozen=True)
+class VentureMonetizationConfig:
+    default_strategy: str
+
+
+@dataclass(frozen=True)
+class VentureBudgetConfig:
+    currency: str
+    amount: int
+
+
+@dataclass(frozen=True)
+class VentureLocalRunnerConfig:
+    required: bool
+    required_by_phase: str
+    executable: Path | None = None
+
+
+@dataclass(frozen=True)
+class VentureDefaultsConfig:
+    monetization: VentureMonetizationConfig
+    monthly_incremental_budget: VentureBudgetConfig
+    lifecycle: VentureLifecycleConfig
+    local_runner: VentureLocalRunnerConfig
+    approval_gates: tuple[str, ...]
+    prohibited_actions: tuple[str, ...]
+    actual_metrics_policy: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     version: int
     mode: str
@@ -86,6 +121,7 @@ class AppConfig:
     cache_ttl_seconds: int
     openclaw: OpenClawConfig
     source_path: Path
+    venture_defaults: VentureDefaultsConfig | None = None
 
     @property
     def sqlite_cache(self) -> Path:

@@ -17,11 +17,44 @@ from .models import (
     ExpectedAgentConfig,
     OpenClawConfig,
     RuntimeConfig,
+    VentureBudgetConfig,
+    VentureDefaultsConfig,
+    VentureLifecycleConfig,
+    VentureLocalRunnerConfig,
+    VentureMonetizationConfig,
 )
 
 _MAX_CONFIG_BYTES = 1_048_576
 _AGENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _AGENT_ROLE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----", re.I),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{30,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{30,}\b", re.I),
+    re.compile(r"\b(password|passwd|secret|token|credential|api[_-]?key|session[_-]?key)\b", re.I),
+)
+_VENTURE_STAGES = (
+    "DISCOVER",
+    "VALIDATE",
+    "FRONTIER_PROTOTYPE",
+    "NORMALIZE",
+    "LOCAL_PARITY",
+    "SHADOW_RUN",
+    "AUTOMATED",
+    "MONITORING",
+    "SCALE",
+    "RETIRE",
+)
+_VENTURE_APPROVALS = (
+    "external_publishing",
+    "account_creation",
+    "payment",
+    "affiliate_application",
+    "production_deployment",
+)
+_VENTURE_PROHIBITED = ("live_trading",)
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -30,10 +63,50 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _known_keys(value: Mapping[str, Any], allowed: set[str], label: str) -> None:
+    unknown = set(value) - allowed
+    if unknown:
+        raise ConfigurationError(f"{label} contains unknown fields")
+
+
+def _contains_secret(value: str) -> bool:
+    return any(pattern.search(value) for pattern in _SECRET_PATTERNS)
+
+
+def _reject_secret_like(value: Any, label: str) -> None:
+    if isinstance(value, str):
+        if _contains_secret(value):
+            raise ConfigurationError(f"{label} contains secret-like text")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _reject_secret_like(item, f"{label}.{key}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_secret_like(item, f"{label}[{index}]")
+
+
 def _integer(value: Any, label: str, *, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ConfigurationError(f"{label} must be an integer from {minimum} to {maximum}")
     return value
+
+
+def _string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ConfigurationError(f"{label} must be a non-empty string")
+    result = value.strip()
+    if _contains_secret(result):
+        raise ConfigurationError(f"{label} contains secret-like text")
+    return result
+
+
+def _string_list(value: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ConfigurationError(f"{label} must be a string list")
+    result = tuple(_string(item, f"{label}[]") for item in value)
+    return result
 
 
 def _absolute_path(value: Any, label: str) -> Path:
@@ -113,6 +186,121 @@ def _expected_agents(value: Any) -> tuple[ExpectedAgentConfig, ...]:
             )
         )
     return tuple(agents)
+
+
+def _local_runner_executable(value: Any) -> Path | None:
+    if value is None:
+        return None
+    path = _absolute_path(value, "venture_defaults.local_runner.executable")
+    if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
+        raise ConfigurationError(
+            "venture_defaults.local_runner.executable must be an executable regular, non-symlink file"
+        )
+    return path
+
+
+def _venture_defaults(value: Any) -> VentureDefaultsConfig | None:
+    if value is None:
+        return None
+    defaults_path = _absolute_path(value, "venture_defaults")
+    document = _load_yaml(defaults_path)
+    _known_keys(document, {"version", "venture_defaults"}, "venture defaults document")
+    _integer(document.get("version"), "venture defaults version", minimum=1, maximum=1)
+    root = _mapping(document.get("venture_defaults"), "venture_defaults")
+    _known_keys(
+        root,
+        {
+            "monetization",
+            "monthly_incremental_budget",
+            "lifecycle",
+            "initial_phase",
+            "local_runner",
+            "approval_gates",
+            "prohibited_actions",
+            "evidence",
+        },
+        "venture_defaults",
+    )
+    _reject_secret_like(root, "venture_defaults")
+
+    monetization_raw = _mapping(root.get("monetization"), "venture_defaults.monetization")
+    _known_keys(monetization_raw, {"default_strategy"}, "venture_defaults.monetization")
+    default_strategy = _string(
+        monetization_raw.get("default_strategy"),
+        "venture_defaults.monetization.default_strategy",
+    )
+    if default_strategy != "affiliate_first":
+        raise ConfigurationError("venture default monetization strategy must be affiliate_first")
+
+    budget_raw = _mapping(
+        root.get("monthly_incremental_budget"),
+        "venture_defaults.monthly_incremental_budget",
+    )
+    _known_keys(budget_raw, {"currency", "amount"}, "venture_defaults.monthly_incremental_budget")
+    currency = _string(budget_raw.get("currency"), "venture_defaults.monthly_incremental_budget.currency")
+    if currency != "KRW":
+        raise ConfigurationError("venture monthly incremental budget currency must be KRW")
+    amount = _integer(
+        budget_raw.get("amount"),
+        "venture_defaults.monthly_incremental_budget.amount",
+        minimum=0,
+        maximum=1_000_000_000,
+    )
+
+    stages = _string_list(root.get("lifecycle"), "venture_defaults.lifecycle")
+    if stages != _VENTURE_STAGES:
+        raise ConfigurationError("venture lifecycle must contain the required stages in order")
+    initial_phase = _string(root.get("initial_phase"), "venture_defaults.initial_phase")
+    if initial_phase != "DISCOVER":
+        raise ConfigurationError("venture initial phase must be DISCOVER")
+
+    runner_raw = _mapping(root.get("local_runner"), "venture_defaults.local_runner")
+    _known_keys(
+        runner_raw,
+        {"required", "required_by_phase", "executable"},
+        "venture_defaults.local_runner",
+    )
+    if runner_raw.get("required") is not True:
+        raise ConfigurationError("venture local runner must be required")
+    required_by_phase = _string(
+        runner_raw.get("required_by_phase"),
+        "venture_defaults.local_runner.required_by_phase",
+    )
+    if required_by_phase != "LOCAL_PARITY":
+        raise ConfigurationError("venture local runner must be required by LOCAL_PARITY")
+
+    approval_gates = _string_list(root.get("approval_gates"), "venture_defaults.approval_gates")
+    if approval_gates != _VENTURE_APPROVALS:
+        raise ConfigurationError("venture approval gates must match the required gates")
+    prohibited_actions = _string_list(
+        root.get("prohibited_actions"),
+        "venture_defaults.prohibited_actions",
+    )
+    if prohibited_actions != _VENTURE_PROHIBITED:
+        raise ConfigurationError("venture prohibited actions must contain only live_trading")
+
+    evidence_raw = _mapping(root.get("evidence"), "venture_defaults.evidence")
+    _known_keys(evidence_raw, {"actual_metrics"}, "venture_defaults.evidence")
+    actual_metrics_policy = _string(
+        evidence_raw.get("actual_metrics"),
+        "venture_defaults.evidence.actual_metrics",
+    )
+    if actual_metrics_policy != "observed_only":
+        raise ConfigurationError("venture actual metrics policy must be observed_only")
+
+    return VentureDefaultsConfig(
+        monetization=VentureMonetizationConfig(default_strategy=default_strategy),
+        monthly_incremental_budget=VentureBudgetConfig(currency=currency, amount=amount),
+        lifecycle=VentureLifecycleConfig(stages=stages, initial_phase=initial_phase),
+        local_runner=VentureLocalRunnerConfig(
+            required=True,
+            required_by_phase=required_by_phase,
+            executable=_local_runner_executable(runner_raw.get("executable")),
+        ),
+        approval_gates=approval_gates,
+        prohibited_actions=prohibited_actions,
+        actual_metrics_policy=actual_metrics_policy,
+    )
 
 
 def load_app_config(path: str | Path) -> AppConfig:
@@ -213,4 +401,5 @@ def load_app_config(path: str | Path) -> AppConfig:
         cache_ttl_seconds=cache_ttl,
         openclaw=openclaw,
         source_path=source_path,
+        venture_defaults=_venture_defaults(raw.get("venture_defaults")),
     )

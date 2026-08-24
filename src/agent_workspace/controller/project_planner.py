@@ -13,10 +13,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..models import AppConfig, ProjectRecord, SecurityBoundaryError
+from ..models import AppConfig, ProjectRecord, SecurityBoundaryError, VentureDefaultsConfig
 from .registry import RegistryReader
 
-PROJECT_TYPES = ("paper", "blog", "quant", "app", "contest", "misc")
+PROJECT_TYPES = ("paper", "blog", "quant", "app", "contest", "misc", "venture")
 VISIBILITIES = ("private", "public")
 _SLUG_CHARS = re.compile(r"[^a-z0-9]+")
 _SECRET_PATTERNS = (
@@ -179,6 +179,8 @@ def _beads_policy(project_type: str, name: str, goal: str) -> dict[str, Any]:
                 else "Not required unless prototype development is included."
             ),
         }
+    if project_type == "venture":
+        return {"enabled": True, "reason": "Venture planning uses Beads by default for validation evidence."}
     return {
         "enabled": long_running,
         "reason": (
@@ -219,7 +221,56 @@ def _warnings(project_type: str, visibility: str) -> list[str]:
         warnings.append("Public visibility requires explicit user approval before execution.")
     if project_type == "quant":
         warnings.append("Do not connect broker accounts, place orders, or run live trading from this plan.")
+    if project_type == "venture":
+        warnings.extend(
+            (
+                "affiliate_first is a default priority, not a success claim or an exclusive monetization model.",
+                "Do not infer actual revenue, conversion rate, success rate, or progress without observed evidence.",
+                "Live trading is prohibited for venture projects.",
+            )
+        )
     return warnings
+
+
+_APPROVAL_LABELS = {
+    "external_publishing": "external publishing",
+    "account_creation": "account creation",
+    "payment": "payment",
+    "affiliate_application": "affiliate application",
+    "production_deployment": "production deployment",
+}
+
+
+def _venture_plan(defaults: VentureDefaultsConfig) -> dict[str, Any]:
+    return {
+        "monetization": {
+            "default_strategy": defaults.monetization.default_strategy,
+        },
+        "monthly_incremental_budget": {
+            "currency": defaults.monthly_incremental_budget.currency,
+            "amount": defaults.monthly_incremental_budget.amount,
+        },
+        "lifecycle": {
+            "stages": list(defaults.lifecycle.stages),
+            "initial_phase": defaults.lifecycle.initial_phase,
+            "current_phase": defaults.lifecycle.initial_phase,
+        },
+        "local_runner": {
+            "required": defaults.local_runner.required,
+            "required_by_phase": defaults.local_runner.required_by_phase,
+            "configured": defaults.local_runner.executable is not None,
+        },
+        "approval_gates": list(defaults.approval_gates),
+        "prohibited_actions": list(defaults.prohibited_actions),
+        "evidence_policy": {"actual_metrics": defaults.actual_metrics_policy},
+    }
+
+
+def _venture_approvals(defaults: VentureDefaultsConfig) -> list[str]:
+    return [
+        f"Approve {_APPROVAL_LABELS.get(item, item.replace('_', ' '))}."
+        for item in defaults.approval_gates
+    ]
 
 
 def _duplicate_candidates(
@@ -271,6 +322,8 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
     project_type = request.project_type.strip().lower()
     if project_type not in PROJECT_TYPES:
         raise ProjectPlanError("project type is unsupported")
+    if project_type == "venture" and config.venture_defaults is None:
+        raise ProjectPlanError("venture defaults are not configured")
     visibility = (request.visibility or "private").strip().lower()
     if visibility not in VISIBILITIES:
         raise ProjectPlanError("visibility is unsupported")
@@ -286,6 +339,8 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
     knowledge_path = _safe_child(config.knowledge_root, f"{slug}.md")
     lead_agent_id = f"{slug}-lead"
     lead_display_name = f"{display_name} Lead"
+    if project_type == "venture":
+        lead_display_name = f"{display_name} Venture Lead"
     beads = _beads_policy(project_type, display_name, goal)
     duplicate_candidates = _duplicate_candidates(
         projects=projects,
@@ -319,8 +374,11 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
             "public_publish": "approval_required",
         },
     }
+    venture = _venture_plan(config.venture_defaults) if project_type == "venture" else None
+    if venture is not None:
+        registry_entry["phase"] = venture["lifecycle"]["initial_phase"]
 
-    return {
+    result = {
         "project_id": slug,
         "slug": slug,
         "display_name": display_name,
@@ -368,3 +426,12 @@ def plan_project(config: AppConfig, request: ProjectPlanRequest) -> dict[str, An
         },
         "executable": False,
     }
+    if venture is not None:
+        result["phase"] = venture["lifecycle"]["initial_phase"]
+        result["venture"] = venture
+        if not venture["local_runner"]["configured"]:
+            result["warnings"].append("Configure the local runner before entering LOCAL_PARITY.")
+        result["approvals_required"] = _approvals(project_type, visibility) + _venture_approvals(
+            config.venture_defaults
+        )
+    return result
