@@ -204,6 +204,22 @@ def test_workspace_root_symlink_is_rejected(tmp_path: Path) -> None:
         validate_plan(plan)
 
 
+@pytest.mark.skipif(
+    not Path("/lib").is_symlink() or not Path("/lib/python3").is_dir(),
+    reason="exact Linux /lib ancestor reproduction is unavailable",
+)
+def test_workspace_root_rejects_lib_symlinked_ancestor_without_path_disclosure(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    plan["workspace_root"] = "/lib/python3"
+    plan["proposed_workspace"] = "/lib/python3/sample-venture"
+
+    with pytest.raises(ApplyContractError, match="symlink") as captured:
+        validate_plan(plan)
+
+    assert plan["workspace_root"] not in str(captured.value)
+    assert plan["proposed_workspace"] not in str(captured.value)
+
+
 def test_intermediate_ancestor_symlink_and_escape_are_rejected(tmp_path: Path) -> None:
     plan = approved_plan(tmp_path)
     root = Path(plan["workspace_root"])
@@ -223,6 +239,25 @@ def test_nonexistent_workspace_with_safe_ancestors_is_allowed(tmp_path: Path) ->
     plan["proposed_workspace"] = str(nested / plan["project_id"])
     assert not Path(plan["proposed_workspace"]).exists()
     validate_plan(plan)
+
+
+def test_nonexistent_workspace_under_real_home_projects_chain_is_allowed(tmp_path: Path) -> None:
+    project_id = "agent-workspace-validator-nonexistent"
+    root = Path.home() / "projects"
+    if not root.is_dir() or root.is_symlink():
+        pytest.skip("a real non-symlink home projects directory is unavailable")
+    workspace = root / project_id
+    assert not workspace.exists() and not workspace.is_symlink()
+    plan = approved_plan(tmp_path)
+    plan["project_id"] = project_id
+    plan["slug"] = project_id
+    plan["workspace_root"] = str(root)
+    plan["proposed_workspace"] = str(workspace)
+    plan["proposed_github_repository"]["name"] = project_id
+    plan["proposed_github_repository"]["full_name"] = f"example/{project_id}"
+
+    validate_plan(plan)
+    assert not workspace.exists() and not workspace.is_symlink()
 
 
 def test_discover_allows_unconfigured_runner_and_warns_for_local_parity(tmp_path: Path) -> None:

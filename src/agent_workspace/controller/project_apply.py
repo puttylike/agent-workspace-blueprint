@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -207,18 +208,15 @@ def _validate_workspace(plan: Mapping[str, Any]) -> None:
     workspace_normal = Path(os.path.abspath(workspace))
     if root != root_normal or workspace != workspace_normal:
         raise ApplyContractError("workspace paths must be lexically normalized")
-    try:
-        root_stat = root.lstat()
-    except OSError as exc:
-        raise ApplyContractError("workspace root must be an existing directory") from exc
-    if root_stat.st_mode & 0o170000 == 0o120000:
-        raise ApplyContractError("workspace root cannot be a symlink")
-    if not root.is_dir():
+    root_deepest = _inspect_workspace_components(root, require_final_directory=True)
+    if root_deepest != root:
         raise ApplyContractError("workspace root must be an existing directory")
     try:
         resolved_root = root.resolve(strict=True)
     except OSError as exc:
         raise ApplyContractError("workspace root must be an existing directory") from exc
+    if resolved_root != root:
+        raise ApplyContractError("workspace path cannot contain a symlink")
     project_id = str(plan.get("project_id", ""))
     if workspace.name != project_id:
         raise ApplyContractError("workspace name must match project_id")
@@ -227,26 +225,44 @@ def _validate_workspace(plan: Mapping[str, Any]) -> None:
             raise ApplyContractError("workspace escapes workspace_root")
     except ValueError as exc:
         raise ApplyContractError("workspace escapes workspace_root") from exc
-    relative = workspace.relative_to(root)
-    current = root
-    deepest_existing = root
-    for part in relative.parts:
-        current = current / part
-        try:
-            current_stat = current.lstat()
-        except FileNotFoundError:
-            break
-        except OSError as exc:
-            raise ApplyContractError("workspace path cannot be inspected safely") from exc
-        if current_stat.st_mode & 0o170000 == 0o120000:
-            raise ApplyContractError("workspace path cannot contain a symlink")
-        deepest_existing = current
+    deepest_existing = _inspect_workspace_components(workspace)
     try:
         resolved_ancestor = deepest_existing.resolve(strict=True)
-        if os.path.commonpath((str(resolved_root), str(resolved_ancestor))) != str(resolved_root):
+        if (
+            resolved_ancestor != deepest_existing
+            or os.path.commonpath((str(resolved_root), str(resolved_ancestor))) != str(resolved_root)
+        ):
             raise ApplyContractError("workspace escapes workspace root")
     except ValueError as exc:
         raise ApplyContractError("workspace escapes workspace root") from exc
+
+
+def _inspect_workspace_components(path: Path, *, require_final_directory: bool = False) -> Path:
+    """lstat every existing component from the filesystem anchor to ``path``."""
+
+    current = Path(path.anchor)
+    components = [current]
+    for part in path.parts[1:]:
+        current = current / part
+        components.append(current)
+    deepest_existing = components[0]
+    for index, current in enumerate(components):
+        final = index == len(components) - 1
+        try:
+            info = current.lstat()
+        except FileNotFoundError as exc:
+            if require_final_directory:
+                raise ApplyContractError("workspace root must be an existing directory") from exc
+            return deepest_existing
+        except OSError as exc:
+            raise ApplyContractError("workspace path cannot be inspected safely") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ApplyContractError("workspace path cannot contain a symlink")
+        if (not final or require_final_directory) and not stat.S_ISDIR(info.st_mode):
+            message = "workspace root must be an existing directory" if require_final_directory else "workspace path cannot be inspected safely"
+            raise ApplyContractError(message)
+        deepest_existing = current
+    return deepest_existing
 
 
 def validate_plan(plan: Mapping[str, Any]) -> tuple[str, ...]:
