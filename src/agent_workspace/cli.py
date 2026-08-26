@@ -74,6 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="planned repository visibility",
     )
     plan.add_argument("--json", action="store_true", help="emit a stable JSON plan")
+    apply = project_commands.add_parser(
+        "apply",
+        help="validate an approval-bound plan and emit its action manifest",
+    )
+    apply.add_argument("--plan-file", required=True, help="canonical JSON plan file")
+    apply.add_argument(
+        "--approval-sha256",
+        required=True,
+        help="exact SHA-256 of canonical plan bytes",
+    )
+    apply.add_argument("--json", action="store_true", help="emit JSON validation output")
 
     agents = commands.add_parser("agents", help="inspect configured agents")
     agent_commands = agents.add_subparsers(dest="agents_command", required=True)
@@ -106,6 +117,33 @@ def _load_config(path: Path) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "projects" and args.projects_command == "apply":
+        from .controller.project_apply import ApplyContractError, validate_approved_plan
+
+        try:
+            result = validate_approved_plan(
+                Path(args.plan_file),
+                args.approval_sha256,
+            )
+        except ApplyContractError as exc:
+            message = {"error": "invalid_project_apply", "reason": str(exc)}
+            if args.json:
+                _json(message)
+            else:
+                print(f"awc: {message['error']}: {message['reason']}")
+            return 2
+        if args.json:
+            _json(result)
+        else:
+            manifest = result["action_manifest"]
+            print(f"Validation: {result['status']}")
+            print(f"Schema: {result['schema_version']}")
+            print(f"Project: {manifest['project_id']}")
+            print(f"Plan SHA-256: {result['plan_sha256']}")
+            print(f"Manifest SHA-256: {manifest['manifest_sha256']}")
+            print("Actions: " + ", ".join(item["action"] for item in manifest["ordered_actions"]))
+            print("Execution performed: false")
+        return 0
     try:
         config_path = _config_path(args.config)
         if args.command == "projects" and args.projects_command == "plan":

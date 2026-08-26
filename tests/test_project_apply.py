@@ -1,0 +1,406 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import socket
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from agent_workspace.cli import main
+from agent_workspace.controller.project_apply import (
+    ACTION_ORDER,
+    APPLY_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
+    ApplyContractError,
+    CollisionObservation,
+    IdempotencyDecision,
+    PreflightInput,
+    TargetState,
+    action_manifest,
+    canonical_json_bytes,
+    classify_preflight,
+    classify_required_preflight,
+    parse_plan_file,
+    plan_sha256,
+    redact_private_values,
+    validate_plan,
+    verify_approval_digest,
+)
+
+
+def approved_plan(tmp_path: Path) -> dict:
+    workspace_root = tmp_path / "projects"
+    workspace_root.mkdir(exist_ok=True)
+    return {
+        "schema_version": APPLY_SCHEMA_VERSION,
+        "project_id": "sample-venture",
+        "slug": "sample-venture",
+        "display_name": "Sample Venture",
+        "type": "venture",
+        "goal": "Discover and validate local-first revenue opportunities.",
+        "visibility": "private",
+        "workspace_root": str(workspace_root),
+        "proposed_workspace": str(workspace_root / "sample-venture"),
+        "proposed_github_repository": {
+            "owner": "example",
+            "name": "sample-venture",
+            "full_name": "example/sample-venture",
+            "visibility": "private",
+            "private": True,
+            "create": False,
+        },
+        "proposed_lead": {
+            "agent_id": "venture",
+            "display_name": "Venture Lead",
+            "role": "PROJECT_LEAD",
+            "create": False,
+        },
+        "beads": {"enabled": True},
+        "phase": "DISCOVER",
+        "venture": {
+            "monetization": {"default_strategy": "affiliate_first"},
+            "monthly_incremental_budget": {"currency": "KRW", "amount": 0},
+            "lifecycle": {
+                "initial_phase": "DISCOVER",
+                "current_phase": "DISCOVER",
+                "stages": ["DISCOVER", "VALIDATE", "LOCAL_PARITY"],
+            },
+            "local_runner": {
+                "required": True,
+                "required_by_phase": "LOCAL_PARITY",
+                "configured": False,
+            },
+            "approval_gates": [
+                "external_publishing",
+                "account_creation",
+                "payment",
+                "affiliate_application",
+                "production_deployment",
+            ],
+            "prohibited_actions": ["live_trading"],
+        },
+        "planned_files": ["README.md", "PROJECT.md", ".gitignore"],
+        "registry_entry": {"id": "sample-venture"},
+        "profile_policy": {
+            "terminal.backend": "local",
+            "model.openai_runtime": "auto",
+            "auxiliary.background_review.enabled": False,
+            "curator.enabled": False,
+            "lsp.enabled": False,
+            "memory.write_approval": True,
+            "skills.write_approval": True,
+            "gateway": "stopped",
+            "cron_jobs": 0,
+            "oauth": "AUTH_REQUIRED",
+        },
+        "executable": False,
+    }
+
+
+def write_canonical(path: Path, plan: dict) -> None:
+    path.write_bytes(canonical_json_bytes(plan))
+
+
+def test_canonical_serialization_is_deterministic_and_has_no_newline(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    reordered = dict(reversed(list(plan.items())))
+
+    assert canonical_json_bytes(plan) == canonical_json_bytes(plan)
+    assert canonical_json_bytes(plan) == canonical_json_bytes(reordered)
+    assert plan_sha256(plan) == plan_sha256(reordered)
+    assert not canonical_json_bytes(plan).endswith(b"\n")
+
+
+def test_one_field_change_invalidates_digest(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    changed = copy.deepcopy(plan)
+    changed["display_name"] = "Changed"
+
+    assert plan_sha256(plan) != plan_sha256(changed)
+    with pytest.raises(ApplyContractError, match="does not match"):
+        verify_approval_digest(changed, plan_sha256(plan))
+
+
+@pytest.mark.parametrize("payload", [b"{", b"[]", b'{"value": NaN}', b'{"value": Infinity}'])
+def test_invalid_json_is_rejected(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "plan.json"
+    path.write_bytes(payload)
+
+    with pytest.raises(ApplyContractError):
+        parse_plan_file(path)
+
+
+def test_non_finite_values_cannot_be_serialized() -> None:
+    with pytest.raises(ApplyContractError):
+        canonical_json_bytes({"value": float("nan")})
+
+
+def test_schema_version_mismatch_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    plan["schema_version"] = "old"
+    with pytest.raises(ApplyContractError, match="version"):
+        validate_plan(plan)
+
+
+def test_bad_approval_digest_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    with pytest.raises(ApplyContractError):
+        verify_approval_digest(plan, "0" * 64)
+    with pytest.raises(ApplyContractError):
+        verify_approval_digest(plan, "A" * 64)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("executable", True), ("visibility", "public")],
+)
+def test_apply_policy_rejections(tmp_path: Path, field: str, value: object) -> None:
+    plan = approved_plan(tmp_path)
+    plan[field] = value
+    with pytest.raises(ApplyContractError):
+        validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    ["../escape", "/", "/tmp/../escape", "relative/path"],
+)
+def test_path_traversal_and_root_escape_are_rejected(tmp_path: Path, workspace: str) -> None:
+    plan = approved_plan(tmp_path)
+    plan["proposed_workspace"] = workspace
+    with pytest.raises(ApplyContractError):
+        validate_plan(plan)
+
+
+def test_symlink_collision_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    root = Path(plan["workspace_root"])
+    target = tmp_path / "target"
+    target.mkdir()
+    Path(plan["proposed_workspace"]).symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ApplyContractError, match="symlink"):
+        validate_plan(plan)
+
+
+def test_workspace_root_must_exist_and_be_a_directory(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    Path(plan["workspace_root"]).rmdir()
+    with pytest.raises(ApplyContractError, match="existing directory"):
+        validate_plan(plan)
+
+
+def test_workspace_root_symlink_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    root = Path(plan["workspace_root"])
+    root.rmdir()
+    target = tmp_path / "real-projects"
+    target.mkdir()
+    root.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ApplyContractError, match="symlink"):
+        validate_plan(plan)
+
+
+@pytest.mark.skipif(
+    not Path("/lib").is_symlink() or not Path("/lib/python3").is_dir(),
+    reason="exact Linux /lib ancestor reproduction is unavailable",
+)
+def test_workspace_root_rejects_lib_symlinked_ancestor_without_path_disclosure(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    plan["workspace_root"] = "/lib/python3"
+    plan["proposed_workspace"] = "/lib/python3/sample-venture"
+
+    with pytest.raises(ApplyContractError, match="symlink") as captured:
+        validate_plan(plan)
+
+    assert plan["workspace_root"] not in str(captured.value)
+    assert plan["proposed_workspace"] not in str(captured.value)
+
+
+def test_intermediate_ancestor_symlink_and_escape_are_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    root = Path(plan["workspace_root"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    intermediate = root / "nested"
+    intermediate.symlink_to(outside, target_is_directory=True)
+    plan["proposed_workspace"] = str(intermediate / plan["project_id"])
+    with pytest.raises(ApplyContractError, match="symlink"):
+        validate_plan(plan)
+
+
+def test_nonexistent_workspace_with_safe_ancestors_is_allowed(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    nested = Path(plan["workspace_root"]) / "safe"
+    nested.mkdir()
+    plan["proposed_workspace"] = str(nested / plan["project_id"])
+    assert not Path(plan["proposed_workspace"]).exists()
+    validate_plan(plan)
+
+
+def test_nonexistent_workspace_under_real_home_projects_chain_is_allowed(tmp_path: Path) -> None:
+    project_id = "agent-workspace-validator-nonexistent"
+    root = Path.home() / "projects"
+    if not root.is_dir() or root.is_symlink():
+        pytest.skip("a real non-symlink home projects directory is unavailable")
+    workspace = root / project_id
+    assert not workspace.exists() and not workspace.is_symlink()
+    plan = approved_plan(tmp_path)
+    plan["project_id"] = project_id
+    plan["slug"] = project_id
+    plan["workspace_root"] = str(root)
+    plan["proposed_workspace"] = str(workspace)
+    plan["proposed_github_repository"]["name"] = project_id
+    plan["proposed_github_repository"]["full_name"] = f"example/{project_id}"
+
+    validate_plan(plan)
+    assert not workspace.exists() and not workspace.is_symlink()
+
+
+def test_discover_allows_unconfigured_runner_and_warns_for_local_parity(tmp_path: Path) -> None:
+    warnings = validate_plan(approved_plan(tmp_path))
+    assert warnings == ("Configure the local runner before entering LOCAL_PARITY.",)
+
+
+def test_missing_approval_gate_is_rejected(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    plan["venture"]["approval_gates"].pop()
+    with pytest.raises(ApplyContractError, match="five"):
+        validate_plan(plan)
+
+
+def test_live_trading_cannot_be_approved(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    plan["venture"]["approval_gates"][-1] = "live_trading"
+    with pytest.raises(ApplyContractError):
+        validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["actual_revenue", "conversion_rate", "success_rate", "progress", "progress_percent"],
+)
+def test_forbidden_metric_keys_are_rejected(tmp_path: Path, metric: str) -> None:
+    plan = approved_plan(tmp_path)
+    plan["venture"][metric] = 0
+    with pytest.raises(ApplyContractError, match="metric"):
+        validate_plan(plan)
+
+
+def test_action_manifest_is_deterministic_identity_bound_and_private_safe(tmp_path: Path) -> None:
+    manifest = action_manifest(approved_plan(tmp_path))
+    assert canonical_json_bytes(manifest) == canonical_json_bytes(action_manifest(approved_plan(tmp_path)))
+    assert manifest["manifest_schema_version"] == MANIFEST_SCHEMA_VERSION
+    assert [item["action"] for item in manifest["ordered_actions"]] == list(ACTION_ORDER)
+    assert all(set(item) == {"order", "action", "required_inputs"} for item in manifest["ordered_actions"])
+    identity = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    assert manifest["manifest_sha256"] == hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+    assert str(tmp_path) not in json.dumps(manifest)
+
+
+def test_any_plan_change_changes_manifest_identity(tmp_path: Path) -> None:
+    plan = approved_plan(tmp_path)
+    changed = copy.deepcopy(plan)
+    changed["display_name"] = "Changed"
+    assert action_manifest(plan)["manifest_sha256"] != action_manifest(changed)["manifest_sha256"]
+    assert action_manifest(plan)["plan_sha256"] != action_manifest(changed)["plan_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        ([TargetState.ABSENT] * 3, IdempotencyDecision.READY_TO_APPLY),
+        ([TargetState.MATCH] * 3, IdempotencyDecision.ALREADY_APPLIED),
+        ([TargetState.ABSENT, TargetState.MATCH], IdempotencyDecision.PARTIAL_COLLISION),
+        ([TargetState.ABSENT, TargetState.DIFFERENT], IdempotencyDecision.CONFLICT),
+    ],
+)
+def test_idempotency_model(states: list[TargetState], expected: IdempotencyDecision) -> None:
+    observations = tuple(CollisionObservation(str(index), state) for index, state in enumerate(states))
+    assert classify_preflight(PreflightInput(observations)).decision == expected
+
+
+def test_policy_or_digest_failure_is_blocked() -> None:
+    observations = (CollisionObservation("workspace", TargetState.ABSENT),)
+    assert classify_preflight(PreflightInput(observations, policy_valid=False)).decision == IdempotencyDecision.BLOCKED
+    assert classify_preflight(PreflightInput(observations, digest_valid=False)).decision == IdempotencyDecision.BLOCKED
+
+
+def test_production_preflight_requires_exact_target_set() -> None:
+    required = ("workspace", "repository", "profile")
+    incomplete = tuple(CollisionObservation(target, TargetState.ABSENT) for target in required[:-1])
+    complete = tuple(CollisionObservation(target, TargetState.ABSENT) for target in required)
+    duplicate = complete[:-1] + (complete[0],)
+
+    assert classify_preflight(PreflightInput(incomplete)).decision == IdempotencyDecision.READY_TO_APPLY
+    assert classify_required_preflight(PreflightInput(incomplete), required).decision == IdempotencyDecision.BLOCKED
+    assert classify_required_preflight(PreflightInput(duplicate), required).decision == IdempotencyDecision.BLOCKED
+    assert classify_required_preflight(PreflightInput(complete), required).decision == IdempotencyDecision.READY_TO_APPLY
+
+
+def test_private_values_are_redacted() -> None:
+    value = {"workspace": "/private/path", "nested": {"oauth_token": "secret-value"}, "safe": "ok"}
+    redacted = redact_private_values(value)
+    assert redacted == {"workspace": "[REDACTED]", "nested": {"oauth_token": "[REDACTED]"}, "safe": "ok"}
+    assert "/private/path" not in json.dumps(redacted)
+    assert "secret-value" not in json.dumps(redacted)
+
+
+def test_public_cli_is_validation_only_and_filesystem_invariant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = approved_plan(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    write_canonical(plan_path, plan)
+    digest = plan_sha256(plan)
+    before = {path.relative_to(tmp_path): (path.stat().st_mode, path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file()}
+    calls: list[str] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        calls.append("mutation")
+        raise AssertionError("public apply attempted an external call")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+
+    code = main(["projects", "apply", "--plan-file", str(plan_path), "--approval-sha256", digest, "--json"])
+    output = json.loads(capsys.readouterr().out)
+    after = {path.relative_to(tmp_path): (path.stat().st_mode, path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file()}
+
+    assert code == 0
+    assert output["execution_performed"] is False
+    assert [item["action"] for item in output["action_manifest"]["ordered_actions"]] == list(ACTION_ORDER)
+    assert calls == []
+    assert after == before
+
+
+def test_public_cli_non_json_prints_identity_digests_and_ordered_actions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = approved_plan(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    write_canonical(plan_path, plan)
+
+    code = main(["projects", "apply", "--plan-file", str(plan_path), "--approval-sha256", plan_sha256(plan)])
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Validation: VALID" in output
+    assert "Project: sample-venture" in output
+    assert f"Plan SHA-256: {plan_sha256(plan)}" in output
+    assert f"Manifest SHA-256: {action_manifest(plan)['manifest_sha256']}" in output
+    assert "Actions: " + ", ".join(ACTION_ORDER) in output
+
+
+def test_public_cli_invalid_plan_remains_nonzero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "bad.json"
+    path.write_bytes(b"{")
+    assert main(["projects", "apply", "--plan-file", str(path), "--approval-sha256", "0" * 64]) != 0
+    assert "invalid_project_apply" in capsys.readouterr().out
